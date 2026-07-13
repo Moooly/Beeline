@@ -85,14 +85,80 @@ class SCODERunner(Runner):
         PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
                              header = 0, index_col = 0)
         colNames = PTData.columns
+
+        # Quit if any trajectory output is missing (matches original behaviour).
         for indx in range(len(colNames)):
-            # Read output
-            outFile = str(indx)+'/meanA.txt'
-            if not (workDir / outFile).exists():
-                # Quit if output file does not exist
-                print(str(workDir / outFile) + ' does not exist, skipping...')
+            if not (workDir / (str(indx)+'/meanA.txt')).exists():
+                print(str(workDir / (str(indx)+'/meanA.txt')) + ' does not exist, skipping...')
                 return
-            OutDF = pd.read_csv(workDir / outFile, sep = '\t', header = None)
+
+        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
+                                     header = 0, index_col = 0)
+        GeneList = list(ExpressionData.index)
+
+        top_k = self._resolve_top_k()
+
+        # Bounded fast path: a single trajectory with a per-target cap. SCODE's
+        # A matrix (meanA.txt) is inherently g x g, but the full g^2 edge list
+        # need not be sorted/written: keep only the top-K regulators per target
+        # (matrix column) via a partial sort. With one trajectory there is no
+        # cross-trajectory max, so this is exact.
+        if top_k is not None and len(colNames) == 1:
+            self._parse_output_topk(workDir / '0/meanA.txt', GeneList, top_k)
+            return
+
+        # General path: original full sort / cross-trajectory max.
+        self._parse_output_full(workDir, colNames, GeneList)
+
+    def _resolve_top_k(self):
+        '''
+        Resolve the maximum number of edges to keep per target gene. GRNScope
+        keeps only the strongest ``maxRegulatorsPerTarget`` edges per target
+        downstream, so retaining more just materialises the full g^2 edge list
+        for nothing. Returns None when absent (standalone BEELINE).
+        '''
+        raw = self.params.get('maxRegulatorsPerTarget')
+        if raw is None:
+            return None
+        try:
+            top_k = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return top_k if top_k > 0 else None
+
+    def _parse_output_topk(self, meanA_path, GeneList, top_k):
+        '''
+        Keep only the top-K regulators per target (matrix column) by absolute
+        weight, using np.argpartition so the full g^2 matrix is never sorted.
+        '''
+        OutMatrix = np.abs(pd.read_csv(meanA_path, sep='\t', header=None).values)
+        n_rows, n_cols = OutMatrix.shape
+        keep = min(top_k, n_rows)
+
+        ranked_rows = []
+        for col in range(n_cols):
+            column = OutMatrix[:, col]
+            if keep < n_rows:
+                candidate_rows = np.argpartition(column, n_rows - keep)[n_rows - keep:]
+            else:
+                candidate_rows = np.arange(n_rows)
+            # Order the kept regulators by descending absolute weight.
+            candidate_rows = candidate_rows[np.argsort(column[candidate_rows])[::-1]]
+            target = GeneList[col]
+            for row in candidate_rows:
+                ranked_rows.append((GeneList[row], target, column[row]))
+
+        self._write_ranked_edges(
+            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
+        )
+
+    def _parse_output_full(self, workDir, colNames, GeneList):
+        '''
+        Original full parse: sort every entry of each trajectory's A matrix,
+        take the cross-trajectory max per edge, and rank descending.
+        '''
+        for indx in range(len(colNames)):
+            OutDF = pd.read_csv(workDir / (str(indx)+'/meanA.txt'), sep = '\t', header = None)
 
             # Sort values in a matrix using code from:
             # https://stackoverflow.com/questions/21922806/sort-values-of-matrix-in-python
@@ -100,11 +166,6 @@ class SCODERunner(Runner):
             idx = np.argsort(OutMatrix, axis = None)[::-1]
             rows, cols = np.unravel_index(idx, OutDF.shape)
             DFSorted = OutMatrix[rows, cols]
-
-            # read input file for list of gene names
-            ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                             header = 0, index_col = 0)
-            GeneList = list(ExpressionData.index)
 
             outFile = open(workDir / ('outFile'+str(indx)+'.csv'),'w')
             outFile.write('Gene1'+'\t'+'Gene2'+'\t'+'EdgeWeight'+'\n')
