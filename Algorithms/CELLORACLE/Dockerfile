@@ -15,13 +15,15 @@ WORKDIR /
 
 # Pin Python for CellOracle compatibility, then install CellOracle (pulls
 # scanpy, scikit-learn, numba, python-igraph, anndata, etc.).
-RUN conda install -y -n base -c conda-forge python=3.10 && \
+# zlib is installed via conda so it lands in /opt/conda/lib, where conda's
+# compiler_compat linker searches — pybedtools' extension links against -lz.
+RUN conda install -y -n base -c conda-forge python=3.10 zlib && \
     conda clean -afy
 
 # Build tooling for velocyto (a CellOracle dependency) whose wheel build compiles
 # Cython extensions and imports numpy at build time.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential time && \
+    apt-get install -y --no-install-recommends build-essential time zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # velocyto does not declare numpy as a build dependency and imports it during its
