@@ -107,7 +107,10 @@ class PearsonRunner(Runner):
         # in place so only a single genes x cells array is held (the operand of
         # every block multiply), instead of separate copies for the DataFrame,
         # centered, and normalized matrices.
-        standardized = ExpressionData.to_numpy(dtype=float)  # genes x cells (own copy)
+        # .values.astype(float) (not .to_numpy) for compatibility with the older
+        # pandas in the BEELINE environment; astype copies, so in-place ops below
+        # are safe. genes x cells.
+        standardized = ExpressionData.values.astype(float)
         del ExpressionData
         standardized -= standardized.mean(axis=1, keepdims=True)  # center in place
         norms = np.sqrt(np.einsum('ij,ij->i', standardized, standardized))
