@@ -36,6 +36,11 @@ RUN pip install --no-cache-dir --no-build-isolation velocyto==0.17.17
 # here — it would conflict with CellOracle's pandas<=1.5.3 pin.
 RUN pip install --no-cache-dir celloracle
 
+# gimmemotifs (a CellOracle dependency) imports pkg_resources at import time,
+# which newer setuptools removed. Pin a setuptools that still ships pkg_resources
+# (installed last so it wins). Fixes "No module named 'pkg_resources'".
+RUN pip install --no-cache-dir "setuptools<81"
+
 # Bake the built-in base GRNs into the image so runtime containers need no
 # network access. Cache under a fixed, world-readable HOME.
 ENV HOME=/root
