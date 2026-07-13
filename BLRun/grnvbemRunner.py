@@ -1,3 +1,5 @@
+import csv
+import heapq
 import os
 import pandas as pd
 
@@ -60,6 +62,22 @@ class GRNVBEMRunner(Runner):
 
             self._run_docker(cmdToRun, append=(idx > 0))
 
+    def _resolve_top_k(self):
+        '''
+        Resolve the maximum number of edges to keep per target gene. GRNScope
+        keeps only the strongest ``maxRegulatorsPerTarget`` edges per target
+        downstream, so retaining more just materialises the full g^2 edge list
+        for nothing. Returns None when absent (standalone BEELINE).
+        '''
+        raw = self.params.get('maxRegulatorsPerTarget')
+        if raw is None:
+            return None
+        try:
+            top_k = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return top_k if top_k > 0 else None
+
     def parseOutput(self):
         '''
         Function to parse outputs from GRNVBEM.
@@ -70,17 +88,89 @@ class GRNVBEMRunner(Runner):
                              header = 0, index_col = 0)
 
         colNames = PTData.columns
-        OutSubDF = [0]*len(colNames)
 
+        # Quit if any trajectory output is missing (matches original behaviour).
         for indx in range(len(colNames)):
-            outFileName = 'outFile'+str(indx)+'.txt'
-            # Quit if output file does not exist
-            if not (workDir / outFileName).exists():
-                print(str(workDir / outFileName) + ' does not exist, skipping...')
+            if not (workDir / ('outFile'+str(indx)+'.txt')).exists():
+                print(str(workDir / ('outFile'+str(indx)+'.txt')) + ' does not exist, skipping...')
                 return
 
-            # Read output
-            OutSubDF[indx] = pd.read_csv(workDir / outFileName, sep = '\t', header = 0)
+        top_k = self._resolve_top_k()
+
+        # Bounded fast path: a single trajectory with a per-target cap. GRNVBEM
+        # scores every parent->child pair (g^2 edges); with one trajectory there
+        # is no cross-trajectory max, so keeping only the top-K parents per target
+        # (Child) in a heap is exact and never loads the full g^2 list into memory.
+        if top_k is not None and len(colNames) == 1:
+            self._parse_output_topk(workDir / 'outFile0.txt', top_k)
+            return
+
+        # General path: original full parse across all trajectories.
+        self._parse_output_full(workDir, colNames)
+
+    def _parse_output_topk(self, out_path, top_k):
+        '''
+        Stream a single trajectory's edge list, keeping only the top-K edges per
+        target (Child) by probability in a heap. GRNScope's target is the Child
+        gene; the emitted orientation matches the original column rename
+        (Parent -> Gene1, Child -> Gene2, Probability -> EdgeWeight).
+        '''
+        target_heaps: dict = {}
+        sequence = 0
+        with out_path.open('r', newline='') as handle:
+            reader = csv.reader(handle, delimiter='\t')
+            header = next(reader, None)
+            if header is None:
+                self._write_ranked_edges(
+                    pd.DataFrame(columns=['Gene1', 'Gene2', 'EdgeWeight'])
+                )
+                return
+            column = {name: index for index, name in enumerate(header)}
+            try:
+                parent_col = column['Parent']
+                child_col = column['Child']
+                probability_col = column['Probability']
+            except KeyError as exc:
+                raise ValueError(f"GRNVBEM output missing expected column: {exc}")
+
+            widest_column = max(parent_col, child_col, probability_col)
+            for row in reader:
+                if len(row) <= widest_column:
+                    continue
+                try:
+                    probability = float(row[probability_col])
+                except ValueError:
+                    continue
+                parent = row[parent_col]
+                child = row[child_col]
+                # GRNScope's target is the Child gene; keep its strongest parents.
+                heap = target_heaps.setdefault(child, [])
+                item = (abs(probability), sequence, parent, child, probability)
+                sequence += 1
+                if len(heap) < top_k:
+                    heapq.heappush(heap, item)
+                elif abs(probability) > heap[0][0]:
+                    heapq.heapreplace(heap, item)
+
+        ranked_rows = []
+        for heap in target_heaps.values():
+            for _abs_probability, _seq, parent, child, probability in sorted(
+                heap, key=lambda entry: (-entry[0], entry[1])
+            ):
+                ranked_rows.append((parent, child, probability))
+
+        self._write_ranked_edges(
+            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
+        )
+
+    def _parse_output_full(self, workDir, colNames):
+        '''
+        Original full parse: cross-trajectory max per edge, ranked descending,
+        with GRNVBEM's columns renamed to GRNScope orientation.
+        '''
+        OutSubDF = [0]*len(colNames)
+        for indx in range(len(colNames)):
+            OutSubDF[indx] = pd.read_csv(workDir / ('outFile'+str(indx)+'.txt'), sep = '\t', header = 0)
 
         outDF = pd.concat(OutSubDF)
         FinalDF = outDF[outDF['Probability'] == outDF.groupby(['Parent','Child'])['Probability'].transform('max')]

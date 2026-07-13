@@ -12,6 +12,8 @@ VERBOSE_VALUE="-q "
 
 # Images pulled from DockerHub (grnbeeline organisation).
 # Referenced in both the --remove-grnbeeline-images block and the pull block.
+# NOTE: CellOracle is NOT here — it is a local-only image (not published to
+# DockerHub), so it can only be produced with --build.
 DOCKERHUB_IMAGES=(
     grnbeeline/arboreto:base
     grnbeeline/grisli:base
@@ -27,6 +29,29 @@ DOCKERHUB_IMAGES=(
     grnbeeline/singe:0.4.1
 )
 
+# Local build targets: "<Algorithms subdirectory>=<image tag>".
+# The tags MATCH the docker_image values in the GRNScope algorithm registry, so
+# `--build` produces exactly the images GRNScope runs (previously the build
+# tagged e.g. arboreto:base while the registry references grnbeeline/arboreto:base).
+# This same list drives --remove-local-images.
+BUILD_TARGETS=(
+    "ARBORETO=grnbeeline/arboreto:base"
+    "CELLORACLE=grnbeeline/celloracle:base"
+    "GRISLI=grnbeeline/grisli:base"
+    "GRNVBEM=grnbeeline/grnvbem:base"
+    "JUMP3=jump3:base"
+    "LEAP=grnbeeline/leap:base"
+    "PIDC=grnbeeline/pidc:base"
+    "PNI=pni:base"
+    "PPCOR=grnbeeline/ppcor:base"
+    "SCNS=scns:base"
+    "SCODE=grnbeeline/scode:base"
+    "SCRIBE=grnbeeline/scribe:base"
+    "SCSGL=scsgl:base"
+    "SINCERITIES=grnbeeline/sincerities:base"
+    "SINGE=grnbeeline/singe:0.4.1"
+)
+
 show_help() {
   echo "Usage: $(basename "$0") [OPTIONS] [ARGUMENTS]"
   echo "This script creates docker containers for BEELINE."
@@ -34,6 +59,7 @@ show_help() {
   echo "Options:"
   echo "  -h, --help                   Display this help message and exit."
   echo "  -b, --build                  Instead of pulling images from docker hub, build them manually locally."
+  echo "                               Images are tagged to match the GRNScope registry (grnbeeline/*)."
   echo "  -v, --verbose                Enable verbose output."
   echo "  --remove-local-images        Remove locally built BEELINE docker images. If combined with --build,"
   echo "                               images are removed first then rebuilt. If used alone, exits after removal."
@@ -81,25 +107,6 @@ if [[ "$HELP" = true ]]; then
     exit 0
 fi
 
-# Images built locally from source in Algorithms/.
-# Referenced in both the --remove-local-images block and the build block.
-LOCAL_IMAGES=(
-    arboreto:base
-    grisli:base
-    grnvbem:base
-    jump3:base
-    leap:base
-    pidc:base
-    pni:base
-    ppcor:base
-    singe:base
-    scns:base
-    scode:base
-    scribe:base
-    sincerities:base
-    scsgl:base
-)
-
 if [[ "$REMOVE_GRNBEELINE" = true ]]; then
     echo "Removing grnbeeline DockerHub images..."
     for image in "${DOCKERHUB_IMAGES[@]}"; do
@@ -119,7 +126,8 @@ fi
 
 if [[ "$REMOVE_LOCAL" = true ]]; then
     echo "Removing locally built BEELINE docker images..."
-    for image in "${LOCAL_IMAGES[@]}"; do
+    for target in "${BUILD_TARGETS[@]}"; do
+        image="${target#*=}"
         if [ "$(docker images -q "$image" 2>/dev/null)" != "" ]; then
             docker rmi "$image"
             echo "Removed $image"
@@ -135,166 +143,35 @@ if [[ "$REMOVE_LOCAL" = true ]]; then
 fi
 
 if [[ "$BUILD" = true ]]; then
+    # Build every algorithm image from Algorithms/, tagged to match the registry.
+    # This may take a while.
+    echo "Building BEELINE docker images (this may take a while)..."
 
-    # Building docker for the different algorithms 
-    echo "This may take a while..."
-    
-    # You may remove the -q flag if you want to see the docker build status
-    pushd $ROOTDIR/Algorithms/ARBORETO
-    docker build -t arboreto:base .
-    if ([ $? = 0 ] && [ "$(docker images -q arboreto:base 2> /dev/null)" != "" ]); then
-        echo "Docker container for ARBORETO is built and tagged as arboreto:base"
-    elif [ "$(docker images -q arboreto:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at arboreto:base"
-    else
-        echo "Oops! Unable to build Docker container for ARBORETO"
-    fi
-    popd
+    for target in "${BUILD_TARGETS[@]}"; do
+        dir="${target%%=*}"       # Algorithms subdirectory
+        image="${target#*=}"      # image tag (matches the GRNScope registry)
+        algo_dir="$ROOTDIR/Algorithms/$dir"
 
-    pushd $ROOTDIR/Algorithms/GRISLI/
-    docker build -t grisli:base .
-    if ([ $? = 0 ] && [ "$(docker images -q grisli:base 2> /dev/null)" != "" ]); then
-        echo "Docker container for GRISLI is built and tagged as grisli:base"
-    elif [ "$(docker images -q grisli:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at grisli:base"
-    else
-        echo "Oops! Unable to build Docker container for GRISLI"
-    fi
-    popd
+        if [ ! -d "$algo_dir" ]; then
+            echo "Skipping $dir: directory not found ($algo_dir)"
+            continue
+        fi
 
-    pushd $ROOTDIR/Algorithms/GRNVBEM/
-    docker build -t grnvbem:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q grnvbem:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for GRNVBEM is built and tagged as  grnvbem:base"
-    elif [ "$(docker images -q grnvbem:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at grnvbem:base"
-    else
-        echo "Oops! Unable to build Docker container for GRNVBEM"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/JUMP3/
-    docker build -t jump3:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q jump3:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for JUMP3 is built and tagged as  jump3:base"
-    elif [ "$(docker images -q jump3:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at jump3:base"
-    else
-        echo "Oops! Unable to build Docker container for JUMP3"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/LEAP/
-    docker build --tag=leap:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q leap:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for LEAP is built and tagged as  leap:base"
-    elif [ "$(docker images -q leap:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at leap:base"
-    else
-        echo "Oops! Unable to build Docker container for LEAP"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/PIDC/
-    docker build -t pidc:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q pidc:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for PIDC is built and tagged as pidc:base"
-    elif [ "$(docker images -q pidc:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at pidc:base"
-    else
-        echo "Oops! Unable to build Docker container for PIDC"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/PNI/
-    docker build -t pni:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q pni:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for PNI is built and tagged as pni:base"
-    elif [ "$(docker images -q pni:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at pni:base"
-    else
-        echo "Oops! Unable to build Docker container for PNI"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/PPCOR/
-    docker build -t ppcor:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q ppcor:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for PPCOR is built and tagged as ppcor:base"
-    elif [ "$(docker images -q ppcor:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at ppcor:base"
-    else
-        echo "Oops! Unable to build Docker container for PPCOR"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/SINGE/
-    docker build -t singe:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q singe:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for SINGE is built and tagged as singe:base"
-    elif [ "$(docker images -q singe:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at singe:base"
-    else
-        echo "Oops! Unable to build Docker container for SINGE"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/SCNS/
-    docker build -t scns:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q scns:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for SCNS is built and tagged as scns:base"
-    elif [ "$(docker images -q scns:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at scns:base"
-    else
-        echo "Oops! Unable to build Docker container for SCNS"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/SCODE/
-    docker build -t scode:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q scode:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for SCODE is built and tagged as scode:base"
-    elif [ "$(docker images -q scode:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at scode:base"
-    else
-        echo "Oops! Unable to build Docker container for SCODE"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/SCRIBE/
-    docker build -t scribe:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q scribe:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for SCRIBE is built and tagged as scribe:base"
-    elif [ "$(docker images -q scribe:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at scribe:base"
-    else
-        echo "Oops! Unable to build Docker container for SCRIBE"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/SINCERITIES/
-    docker build -t sincerities:base .
-    if ([ $? = 0 ] && [ "$(docker images -q sincerities:base 2> /dev/null)" != "" ]); then
-        echo "Docker container for SINCERITIES is built and tagged as sincerities:base"
-    elif [ "$(docker images -q sincerities:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at sincerities:base"
-    else
-        echo "Oops! Unable to build Docker container for SINCERITIES"
-    fi
-    popd
-
-    pushd $ROOTDIR/Algorithms/SCSGL/
-    docker build -t scsgl:base .
-    if ([ $? = 0 ] && [[ "$(docker images -q scsgl:base 2> /dev/null)" != "" ]]); then
-        echo "Docker container for SCSGL is built and tagged as scsgl:base"
-    elif [ "$(docker images -q scsgl:base 2> /dev/null)" != "" ]; then
-        echo "Docker container failed to build, but an existing image exists at scsgl:base"
-    else
-        echo "Oops! Unable to build Docker container for SCSGL"
-    fi
-    popd
+        echo "----- Building $dir -> $image -----"
+        pushd "$algo_dir" > /dev/null
+        # '|| true' so one failing build does not abort the whole run (set -e);
+        # the image check below reports per-algorithm success/failure.
+        docker build ${VERBOSE_VALUE}-t "$image" . || true
+        if [ "$(docker images -q "$image" 2>/dev/null)" != "" ]; then
+            echo "Docker container for $dir is built and tagged as $image"
+        else
+            echo "Oops! Unable to build Docker container for $dir"
+        fi
+        popd > /dev/null
+    done
 else
     echo "Pulling docker images from https://hub.docker.com/u/grnbeeline..."
+    echo "NOTE: CellOracle is local-only; use --build to produce grnbeeline/celloracle:base."
     for image in "${DOCKERHUB_IMAGES[@]}"; do
         docker image pull $VERBOSE_VALUE "$image"
     done

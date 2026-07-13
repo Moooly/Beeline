@@ -1,3 +1,5 @@
+import csv
+import heapq
 import os
 import pandas as pd
 
@@ -118,16 +120,87 @@ class SINGERunner(Runner):
                              header = 0, index_col = 0)
 
         colNames = PTData.columns
-        OutSubDF = [0]*len(colNames)
 
+        # Quit if any trajectory output is missing (matches original behaviour).
         for idx in range(len(colNames)):
-
-            # Quit if output directory does not exist
             if not (workDir / str(idx) / 'SINGE_Ranked_Edge_List.txt').exists():
                 print(str(workDir / str(idx) / 'SINGE_Ranked_Edge_List.txt') + ' does not exist, skipping...')
                 return
 
-            # Read output
+        top_k = self._resolve_top_k()
+
+        # Bounded fast path: a single trajectory with a per-target cap. With one
+        # trajectory there is no cross-trajectory max, so keeping only the top-K
+        # edges per target (by |EdgeWeight|) in a heap is exact and never loads
+        # the full g^2 edge list into memory.
+        if top_k is not None and len(colNames) == 1:
+            self._parse_output_topk(workDir / '0' / 'SINGE_Ranked_Edge_List.txt', top_k)
+            return
+
+        # General path: original full parse across all trajectories.
+        self._parse_output_full(workDir, colNames)
+
+    def _resolve_top_k(self):
+        '''
+        Resolve the maximum number of edges to keep per target gene. GRNScope
+        keeps only the strongest ``maxRegulatorsPerTarget`` edges per target
+        downstream, so retaining more just materialises the full g^2 edge list
+        for nothing. Returns None when absent (standalone BEELINE).
+        '''
+        raw = self.params.get('maxRegulatorsPerTarget')
+        if raw is None:
+            return None
+        try:
+            top_k = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return top_k if top_k > 0 else None
+
+    def _parse_output_topk(self, out_path, top_k):
+        '''
+        Stream a single trajectory's ranked edge list (tab-separated, with a
+        header) and keep only the top-K edges per target (Gene2, column 1) by
+        absolute weight in a heap, matching GRNScope's downstream per-target cap.
+        '''
+        target_heaps: dict = {}
+        sequence = 0
+        with out_path.open('r', newline='') as handle:
+            reader = csv.reader(handle, delimiter='\t')
+            next(reader, None)  # discard header row (column names are overwritten)
+            for row in reader:
+                if len(row) < 3:
+                    continue
+                try:
+                    weight = float(row[2])
+                except ValueError:
+                    continue
+                gene1, gene2 = row[0], row[1]
+                # GRNScope groups by Gene2 (target).
+                heap = target_heaps.setdefault(gene2, [])
+                item = (abs(weight), sequence, gene1, gene2, weight)
+                sequence += 1
+                if len(heap) < top_k:
+                    heapq.heappush(heap, item)
+                elif abs(weight) > heap[0][0]:
+                    heapq.heapreplace(heap, item)
+
+        ranked_rows = []
+        for heap in target_heaps.values():
+            for _abs_weight, _seq, gene1, gene2, weight in sorted(
+                heap, key=lambda entry: (-entry[0], entry[1])
+            ):
+                ranked_rows.append((gene1, gene2, weight))
+
+        self._write_ranked_edges(
+            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
+        )
+
+    def _parse_output_full(self, workDir, colNames):
+        '''
+        Original full parse: cross-trajectory max per edge, ranked descending.
+        '''
+        OutSubDF = [0]*len(colNames)
+        for idx in range(len(colNames)):
             OutSubDF[idx] = pd.read_csv(workDir / str(idx) / 'SINGE_Ranked_Edge_List.txt',
                                 sep = '\t', header = 0)
         # megre the dataframe by taking the maximum value from each DF

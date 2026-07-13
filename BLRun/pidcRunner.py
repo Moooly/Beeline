@@ -1,3 +1,5 @@
+import csv
+import heapq
 import os
 import pandas as pd
 
@@ -36,6 +38,22 @@ class PIDCRunner(Runner):
 
         self._run_docker(cmdToRun)
 
+    def _resolve_top_k(self):
+        '''
+        Resolve the maximum number of edges to keep per target gene. GRNScope
+        keeps only the strongest ``maxRegulatorsPerTarget`` edges per target
+        downstream, so retaining more just materialises the full g^2 edge list
+        for nothing. Returns None when absent (standalone BEELINE).
+        '''
+        raw = self.params.get('maxRegulatorsPerTarget')
+        if raw is None:
+            return None
+        try:
+            top_k = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return top_k if top_k > 0 else None
+
     def parseOutput(self):
         '''
         Function to parse outputs from PIDC.
@@ -48,6 +66,61 @@ class PIDCRunner(Runner):
             print(str(outFile) + ' does not exist, skipping...')
             return
 
+        top_k = self._resolve_top_k()
+
+        # PIDC has no pseudotime/trajectories, so there is a single output file
+        # and no cross-trajectory merge. Keeping only the top-K edges per target
+        # (by |EdgeWeight|) in a heap is exact and never loads the full g^2 edge
+        # list into memory.
+        if top_k is not None:
+            self._parse_output_topk(outFile, top_k)
+            return
+
+        self._parse_output_full(outFile)
+
+    def _parse_output_topk(self, outFile, top_k):
+        '''
+        Stream the headerless edge list and keep only the top-K edges per target
+        (Gene2, column 1) by absolute weight in a heap, matching GRNScope's
+        downstream per-target cap without loading the full g^2 list.
+        '''
+        target_heaps: dict = {}
+        sequence = 0
+        with outFile.open('r', newline='') as handle:
+            reader = csv.reader(handle, delimiter='\t')
+            for row in reader:
+                if len(row) < 3:
+                    continue
+                try:
+                    weight = float(row[2])
+                except ValueError:
+                    continue
+                gene1 = row[0]
+                gene2 = row[1]
+                # GRNScope groups by Gene2 (target).
+                heap = target_heaps.setdefault(gene2, [])
+                item = (abs(weight), sequence, gene1, gene2, weight)
+                sequence += 1
+                if len(heap) < top_k:
+                    heapq.heappush(heap, item)
+                elif abs(weight) > heap[0][0]:
+                    heapq.heapreplace(heap, item)
+
+        ranked_rows = []
+        for heap in target_heaps.values():
+            for _abs_weight, _seq, gene1, gene2, weight in sorted(
+                heap, key=lambda entry: (-entry[0], entry[1])
+            ):
+                ranked_rows.append((gene1, gene2, weight))
+
+        self._write_ranked_edges(
+            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
+        )
+
+    def _parse_output_full(self, outFile):
+        '''
+        Original full parse: pass every edge through unchanged.
+        '''
         # Read output (headerless: col 0 = Gene1, col 1 = Gene2, col 2 = EdgeWeight)
         OutDF = pd.read_csv(outFile, sep = '\t', header = None)
 

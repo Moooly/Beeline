@@ -3,6 +3,7 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 
+from BLRun.celloracleRunner import CellOracleRunner
 from BLRun.genie3Runner import GENIE3Runner
 from BLRun.grnboost2Runner import GRNBoost2Runner
 from BLRun.grisliRunner import GRISLIRunner
@@ -19,6 +20,7 @@ from BLRun.singeRunner import SINGERunner
 from BLRun.pearsonRunner import PearsonRunner
 
 RUNNERS = {
+    'CELLORACLE':   CellOracleRunner,
     'GENIE3':       GENIE3Runner,
     'GRNBOOST2':    GRNBoost2Runner,
     'GRISLI':       GRISLIRunner,
