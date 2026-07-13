@@ -1,3 +1,5 @@
+import csv
+import heapq
 import os
 import pandas as pd
 import numpy as np
@@ -64,6 +66,24 @@ class LEAPRunner(Runner):
 
             self._run_docker(cmdToRun, append=(idx > 0))
 
+    def _resolve_top_k(self):
+        '''
+        Resolve the maximum number of edges to keep per target gene.
+
+        GRNScope keeps only the strongest ``maxRegulatorsPerTarget`` edges per
+        target downstream, so retaining more here just materialises the full
+        g x g edge list for nothing. Returns None when the cap is absent
+        (standalone BEELINE), preserving the original full output.
+        '''
+        raw = self.params.get('maxRegulatorsPerTarget')
+        if raw is None:
+            return None
+        try:
+            top_k = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return top_k if top_k > 0 else None
+
     def parseOutput(self):
         '''
         Function to parse outputs from LEAP.
@@ -74,20 +94,90 @@ class LEAPRunner(Runner):
                              header = 0, index_col = 0)
 
         colNames = PTData.columns
-        OutSubDF = [0]*len(colNames)
+        outFileNames = ['outFile' + str(indx) + '.txt' for indx in range(len(colNames))]
 
-        for indx in range(len(colNames)):
-            outFileName = 'outFile'+str(indx)+'.txt'
-            # Quit if output file does not exist
+        # Quit if any trajectory output is missing (matches original behaviour).
+        for outFileName in outFileNames:
             if not (workDir / outFileName).exists():
                 print(str(workDir / outFileName) + ' does not exist, skipping...')
                 return
 
-            # Read output
-            OutSubDF[indx] = pd.read_csv(workDir / outFileName, sep = '\t', header = 0)
+        top_k = self._resolve_top_k()
+
+        # Bounded fast path: a single trajectory with a per-target cap. With one
+        # trajectory there is no cross-trajectory max, so keeping only the top-K
+        # edges per target (by |Score|) in a heap is exact and never loads the
+        # full g^2 edge list into memory.
+        if top_k is not None and len(colNames) == 1:
+            self._parse_output_topk(workDir / outFileNames[0], top_k)
+            return
+
+        # General path: full parse across all trajectories (cross-trajectory max).
+        self._parse_output_full(workDir, outFileNames)
+
+    def _parse_output_topk(self, out_path, top_k):
+        '''
+        Stream a single trajectory's edge list and keep only the top-K edges per
+        target (by absolute correlation) using a heap, so the full g^2 list is
+        never held in memory. LEAP is unsigned, so the weight is |Score|.
+        '''
+        target_heaps: dict = {}
+        sequence = 0
+        with out_path.open('r', newline='') as handle:
+            reader = csv.reader(handle, delimiter='\t')
+            header = next(reader, None)
+            if header is None:
+                self._write_ranked_edges(
+                    pd.DataFrame(columns=['Gene1', 'Gene2', 'EdgeWeight'])
+                )
+                return
+            column = {name: index for index, name in enumerate(header)}
+            try:
+                gene1_col, gene2_col, score_col = (
+                    column['Gene1'], column['Gene2'], column['Score']
+                )
+            except KeyError as exc:
+                raise ValueError(f"LEAP output missing expected column: {exc}")
+
+            widest_column = max(gene1_col, gene2_col, score_col)
+            for row in reader:
+                if len(row) <= widest_column:
+                    continue
+                try:
+                    score = abs(float(row[score_col]))
+                except ValueError:
+                    continue
+                gene1, gene2 = row[gene1_col], row[gene2_col]
+                heap = target_heaps.setdefault(gene2, [])
+                item = (score, sequence, gene1, gene2)
+                sequence += 1
+                if len(heap) < top_k:
+                    heapq.heappush(heap, item)
+                elif score > heap[0][0]:
+                    heapq.heapreplace(heap, item)
+
+        ranked_rows = []
+        for heap in target_heaps.values():
+            for score, _seq, gene1, gene2 in sorted(
+                heap, key=lambda entry: (-entry[0], entry[1])
+            ):
+                ranked_rows.append((gene1, gene2, score))
+
+        self._write_ranked_edges(
+            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
+        )
+
+    def _parse_output_full(self, workDir, outFileNames):
+        '''
+        Original full parse: absolute correlation, max across trajectories per
+        edge, ranked descending.
+        '''
+        OutSubDF = [0] * len(outFileNames)
+        for indx, outFileName in enumerate(outFileNames):
+            OutSubDF[indx] = pd.read_csv(workDir / outFileName, sep='\t', header=0)
             OutSubDF[indx].Score = np.abs(OutSubDF[indx].Score)
         outDF = pd.concat(OutSubDF)
-        FinalDF = outDF[outDF['Score'] == outDF.groupby(['Gene1','Gene2'])['Score'].transform('max')]
+        FinalDF = outDF[outDF['Score'] == outDF.groupby(['Gene1', 'Gene2'])['Score'].transform('max')]
 
         self._write_ranked_edges(FinalDF.sort_values('Score', ascending=False).rename(
             columns={'Score': 'EdgeWeight'}
