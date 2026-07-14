@@ -30,13 +30,22 @@ class GENIE3Runner(Runner):
         Function to run GENIE3 algorithm
         '''
 
+        # Forest hyperparameters. Fall back to the entrypoint's own defaults
+        # (n_estimators=400, max_features='sqrt') when unset, so standalone
+        # BEELINE runs without a params map behave exactly as before.
+        n_estimators = str(self.params.get('nEstimators', 400))
+        max_features = str(self.params.get('maxFeatures', 'sqrt'))
+
         cmdToRun = ' '.join(['docker run --rm',
                             f"-v {self.working_dir}:/usr/working_dir",
                             '--expose=41269',
                             f'{self.image} /bin/sh -c \"time -v -o',
                             "/usr/working_dir/time.txt",
                             'python runArboreto.py --algo=GENIE3',
-                            '--inFile=/usr/working_dir/ExpressionData.csv', '--outFile=/usr/working_dir/outFile.txt', '\"'])
+                            '--inFile=/usr/working_dir/ExpressionData.csv',
+                            '--outFile=/usr/working_dir/outFile.txt',
+                            f'--nEstimators={n_estimators}',
+                            f'--maxFeatures={max_features}', '\"'])
 
         self._run_docker(cmdToRun)
 

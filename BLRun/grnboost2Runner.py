@@ -29,13 +29,24 @@ class GRNBoost2Runner(Runner):
         Function to run GRNBOOST2 algorithm
         '''
 
+        # Boosting hyperparameters. Fall back to the entrypoint's own defaults
+        # (learning_rate=0.01, n_estimators=5000, max_features=0.1) when unset,
+        # so standalone BEELINE runs without a params map behave as before.
+        learning_rate = str(self.params.get('learningRate', 0.01))
+        n_estimators = str(self.params.get('nEstimators', 5000))
+        max_features = str(self.params.get('maxFeatures', 0.1))
+
         cmdToRun = ' '.join(['docker run --rm',
                             f"-v {self.working_dir}:/usr/working_dir",
                             '--expose=41269',
                             f'{self.image} /bin/sh -c \"time -v -o',
                             "/usr/working_dir/time.txt",
                             'python runArboreto.py --algo=GRNBoost2',
-                            '--inFile=/usr/working_dir/ExpressionData.csv', '--outFile=/usr/working_dir/outFile.txt', '\"'])
+                            '--inFile=/usr/working_dir/ExpressionData.csv',
+                            '--outFile=/usr/working_dir/outFile.txt',
+                            f'--learningRate={learning_rate}',
+                            f'--nEstimators={n_estimators}',
+                            f'--maxFeatures={max_features}', '\"'])
 
         self._run_docker(cmdToRun)
 

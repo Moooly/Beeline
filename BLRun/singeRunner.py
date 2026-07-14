@@ -45,15 +45,19 @@ class SINGERunner(Runner):
             'prob_zero_removal', 'prob_remove_samples',
             'family'
         ]
+        # Standalone-BEELINE fallbacks, used only when a param is omitted from
+        # the config. Kept in sync with the GRNScope algorithm registry
+        # (backend/app/algorithm_registry.py, SINGE) so both entry points share
+        # one set of defaults. GRNScope always supplies these explicitly.
         default_params = {
             'lambda': '0.01',
-            'dT': '10',
+            'dT': '15',
             'num_lags': '5',
-            'kernel_width': '4',
+            'kernel_width': '0.5',
             'prob_zero_removal': '0',
-            'prob_remove_samples': '0.2',
+            'prob_remove_samples': '0.0',
             'family': 'gaussian',
-            'num_replicates': '2',
+            'num_replicates': '3',
         }
         params = self.params
         for param, val in default_params.items():

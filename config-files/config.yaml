@@ -72,9 +72,9 @@ input_settings:
           image: "grnbeeline/scode:base"
           should_run: [True]
           params:
-              z: [10]
+              z: [4]
               nIter: [1000]
-              nRep: [6]
+              nRep: [3]
 
 
         - algorithm_id: "SINCERITIES"
@@ -97,7 +97,7 @@ input_settings:
           should_run: [True]
           params:
               L: [10]
-              R: [3000]
+              R: [1000]
               alphaMin: [0.0]
 
 
@@ -112,7 +112,7 @@ input_settings:
               prob_zero_removal: [0]
               prob_remove_samples: [0.0]
               family: ["gaussian"]
-              num_replicates: [6]
+              num_replicates: [3]
 
 
         - algorithm_id: "SCRIBE"
