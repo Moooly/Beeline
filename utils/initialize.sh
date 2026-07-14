@@ -1,40 +1,44 @@
 #!/bin/bash
 
 set -e # abandon script on error
-BASEDIR="$(dirname "$(readlink -f "$0")")" # set env variable for current directory (utils/)
-ROOTDIR="$(dirname "$BASEDIR")"           # parent directory of BASEDIR (repo root)
+BASEDIR="$(dirname "$(readlink -f "$0")")" # utils/
+ROOTDIR="$(dirname "$BASEDIR")"           # repo root
 
-BUILD=false
+BUILD_ALL=false
 HELP=false
-REMOVE_LOCAL=false
-REMOVE_GRNBEELINE=false
+REMOVE_IMAGES=false
 VERBOSE_VALUE="-q "
 
-# Images pulled from DockerHub (grnbeeline organisation).
-# Referenced in both the --remove-grnbeeline-images block and the pull block.
-# NOTE: CellOracle is NOT here — it is a local-only image (not published to
-# DockerHub), so it can only be produced with --build.
-DOCKERHUB_IMAGES=(
-    grnbeeline/arboreto:base
+# ---------------------------------------------------------------------------
+# Tested published images to PULL, for algorithms we did NOT modify inside the
+# image. Any changes to these algorithms live host-side (BLRun/*.py + GRNScope),
+# NOT in the image, so the published DockerHub builds are correct and reliable.
+# (arboreto is excluded — we build it locally; celloracle is not published.)
+# ---------------------------------------------------------------------------
+PULL_IMAGES=(
     grnbeeline/grisli:base
     grnbeeline/grnvbem:base
     grnbeeline/leap:base
     grnbeeline/pidc:base
     grnbeeline/ppcor:base
-    grnbeeline/scinge:base
-    grnbeeline/scns:base
     grnbeeline/scode:base
     grnbeeline/scribe:base
     grnbeeline/sincerities:base
     grnbeeline/singe:0.4.1
 )
 
-# Local build targets: "<Algorithms subdirectory>=<image tag>".
-# The tags MATCH the docker_image values in the GRNScope algorithm registry, so
-# `--build` produces exactly the images GRNScope runs (previously the build
-# tagged e.g. arboreto:base while the registry references grnbeeline/arboreto:base).
-# This same list drives --remove-local-images.
-BUILD_TARGETS=(
+# Images that MUST be built locally. The default run builds exactly these:
+#   ARBORETO   — contains our modified runArboreto.py (GENIE3 / GRNBOOST2)
+#   CELLORACLE — new algorithm, not published to DockerHub
+LOCAL_ONLY_TARGETS=(
+    "ARBORETO=grnbeeline/arboreto:base"
+    "CELLORACLE=grnbeeline/celloracle:base"
+)
+
+# Full set for --build-all (rebuild EVERY image from source).
+# WARNING: some local Dockerfiles do not reproduce the published images (e.g. the
+# SINGE Dockerfile lacks octave), so prefer the default for real deployments.
+ALL_BUILD_TARGETS=(
     "ARBORETO=grnbeeline/arboreto:base"
     "CELLORACLE=grnbeeline/celloracle:base"
     "GRISLI=grnbeeline/grisli:base"
@@ -53,33 +57,35 @@ BUILD_TARGETS=(
 )
 
 show_help() {
-  echo "Usage: $(basename "$0") [OPTIONS] [ARGUMENTS]"
-  echo "This script creates docker containers for BEELINE."
+  echo "Usage: $(basename "$0") [OPTIONS]"
+  echo "Set up BEELINE docker images for GRNScope."
+  echo ""
+  echo "Default (no options) — the recommended, correct setup:"
+  echo "  1. Pull the tested published images for unchanged algorithms."
+  echo "  2. Build ONLY the images that must be local:"
+  echo "       - arboreto   (modified: GENIE3 / GRNBOOST2)"
+  echo "       - celloracle (new, not published)"
+  echo "  It does not rebuild images that don't need it (avoids e.g. breaking"
+  echo "  SINGE, whose local Dockerfile lacks octave)."
   echo ""
   echo "Options:"
-  echo "  -h, --help                   Display this help message and exit."
-  echo "  -b, --build                  Instead of pulling images from docker hub, build them manually locally."
-  echo "                               Images are tagged to match the GRNScope registry (grnbeeline/*)."
-  echo "  -v, --verbose                Enable verbose output."
-  echo "  --remove-local-images        Remove locally built BEELINE docker images. If combined with --build,"
-  echo "                               images are removed first then rebuilt. If used alone, exits after removal."
-  echo "  --remove-grnbeeline-images   Remove DockerHub (grnbeeline) BEELINE docker images. If combined with --build,"
-  echo "                               images are removed first then rebuilt. If used alone, exits after removal."
-  echo ""
-  echo "Requirements:"
-  echo "  docker (last version tested 28.5.1, build e180ab8)"
-  echo "  conda (last version tested 25.9.0)"
-  echo "  git"
+  echo "  -h, --help        Display this help and exit."
+  echo "  --build-all       Rebuild EVERY image from source locally (advanced)."
+  echo "                    WARNING: local Dockerfiles may not reproduce the"
+  echo "                    published images (e.g. SINGE needs octave)."
+  echo "  -v, --verbose     Enable verbose docker output."
+  echo "  --remove-images   Remove all managed BEELINE images, then exit (combine"
+  echo "                    with --build-all to remove then rebuild)."
   echo ""
   echo "Examples:"
-  echo "  $(basename "$0")"
-  echo "  $(basename "$0") -b --verbose"
+  echo "  $(basename "$0")               # correct setup: pull + build arboreto/celloracle"
+  echo "  $(basename "$0") --build-all   # rebuild everything from source"
 }
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    -b|--build)
-      BUILD=true
+    --build-all|-b)
+      BUILD_ALL=true
       ;;
     -v|--verbose)
       VERBOSE_VALUE=""
@@ -87,11 +93,8 @@ while [[ "$#" -gt 0 ]]; do
     -h|--help)
       HELP=true
       ;;
-    --remove-local-images)
-      REMOVE_LOCAL=true
-      ;;
-    --remove-grnbeeline-images)
-      REMOVE_GRNBEELINE=true
+    --remove-images|--remove-local-images|--remove-grnbeeline-images)
+      REMOVE_IMAGES=true
       ;;
     *)
       echo "Unknown option: $1" >&2
@@ -99,7 +102,7 @@ while [[ "$#" -gt 0 ]]; do
       exit 1
       ;;
   esac
-  shift # Consume the current argument (flag or value)
+  shift
 done
 
 if [[ "$HELP" = true ]]; then
@@ -107,50 +110,12 @@ if [[ "$HELP" = true ]]; then
     exit 0
 fi
 
-if [[ "$REMOVE_GRNBEELINE" = true ]]; then
-    echo "Removing grnbeeline DockerHub images..."
-    for image in "${DOCKERHUB_IMAGES[@]}"; do
-        if [ "$(docker images -q "$image" 2>/dev/null)" != "" ]; then
-            docker rmi "$image"
-            echo "Removed $image"
-        fi
-    done
-    echo "Done removing grnbeeline images."
-
-    # Exit here unless --build was also specified, in which case fall through
-    # to rebuild the images immediately after removal.
-    if [[ "$BUILD" = false ]]; then
-        exit 0
-    fi
-fi
-
-if [[ "$REMOVE_LOCAL" = true ]]; then
-    echo "Removing locally built BEELINE docker images..."
-    for target in "${BUILD_TARGETS[@]}"; do
-        image="${target#*=}"
-        if [ "$(docker images -q "$image" 2>/dev/null)" != "" ]; then
-            docker rmi "$image"
-            echo "Removed $image"
-        fi
-    done
-    echo "Done removing local images."
-
-    # Exit here unless --build was also specified, in which case fall through
-    # to rebuild the images immediately after removal.
-    if [[ "$BUILD" = false ]]; then
-        exit 0
-    fi
-fi
-
-if [[ "$BUILD" = true ]]; then
-    # Build every algorithm image from Algorithms/, tagged to match the registry.
-    # This may take a while.
-    echo "Building BEELINE docker images (this may take a while)..."
-
-    for target in "${BUILD_TARGETS[@]}"; do
-        dir="${target%%=*}"       # Algorithms subdirectory
-        image="${target#*=}"      # image tag (matches the GRNScope registry)
-        algo_dir="$ROOTDIR/Algorithms/$dir"
+# Build a list of "DIR=tag" targets from Algorithms/, tagged for the registry.
+build_targets() {
+    for target in "$@"; do
+        local dir="${target%%=*}"
+        local image="${target#*=}"
+        local algo_dir="$ROOTDIR/Algorithms/$dir"
 
         if [ ! -d "$algo_dir" ]; then
             echo "Skipping $dir: directory not found ($algo_dir)"
@@ -159,20 +124,50 @@ if [[ "$BUILD" = true ]]; then
 
         echo "----- Building $dir -> $image -----"
         pushd "$algo_dir" > /dev/null
-        # '|| true' so one failing build does not abort the whole run (set -e);
-        # the image check below reports per-algorithm success/failure.
+        # '|| true' so one failing build does not abort the whole run (set -e).
         docker build ${VERBOSE_VALUE}-t "$image" . || true
         if [ "$(docker images -q "$image" 2>/dev/null)" != "" ]; then
-            echo "Docker container for $dir is built and tagged as $image"
+            echo "Docker image for $dir is built and tagged as $image"
         else
-            echo "Oops! Unable to build Docker container for $dir"
+            echo "Oops! Unable to build Docker image for $dir"
         fi
         popd > /dev/null
     done
-else
-    echo "Pulling docker images from https://hub.docker.com/u/grnbeeline..."
-    echo "NOTE: CellOracle is local-only; use --build to produce grnbeeline/celloracle:base."
-    for image in "${DOCKERHUB_IMAGES[@]}"; do
-        docker image pull $VERBOSE_VALUE "$image"
+}
+
+if [[ "$REMOVE_IMAGES" = true ]]; then
+    echo "Removing BEELINE docker images managed by this script..."
+    REMOVE_TAGS=("${PULL_IMAGES[@]}")
+    for target in "${ALL_BUILD_TARGETS[@]}"; do
+        REMOVE_TAGS+=("${target#*=}")
     done
+    for image in "${REMOVE_TAGS[@]}"; do
+        if [ "$(docker images -q "$image" 2>/dev/null)" != "" ]; then
+            docker rmi "$image" || true
+            echo "Removed $image"
+        fi
+    done
+    echo "Done removing images."
+
+    # Exit after removal unless a rebuild was explicitly requested.
+    if [[ "$BUILD_ALL" = false ]]; then
+        exit 0
+    fi
 fi
+
+if [[ "$BUILD_ALL" = true ]]; then
+    echo "Building ALL images from source locally (this may take a while)..."
+    echo "WARNING: local Dockerfiles may not reproduce the published images."
+    build_targets "${ALL_BUILD_TARGETS[@]}"
+else
+    echo "Pulling tested published images for unchanged algorithms..."
+    for image in "${PULL_IMAGES[@]}"; do
+        docker image pull $VERBOSE_VALUE "$image" || echo "WARNING: failed to pull $image"
+    done
+    echo ""
+    echo "Building the images that must be local (arboreto = modified, celloracle = new)..."
+    build_targets "${LOCAL_ONLY_TARGETS[@]}"
+fi
+
+echo ""
+echo "Done. GRNScope BEELINE images are ready."
