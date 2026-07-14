@@ -69,6 +69,13 @@ class SINGERunner(Runner):
         for replicate in range(num_replicates):
            replicates.append(' '.join('--' + p.replace('_', '-') + ' ' + str(params[p]) for p in params_order) + ' '.join(['', '--replicate', str(replicate), '--ID', str(replicate)]))
         params_str = '\n'.join(replicates)
+        # Write parameter data directly instead of interpolating it into the
+        # container shell command. This keeps configuration values out of shell
+        # syntax even when the runner is used outside GRNScope's API validation.
+        (self.working_dir / 'hyperparameters.txt').write_text(
+            params_str + '\n',
+            encoding='utf-8',
+        )
 
         PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
                              header = 0, index_col = 0)
@@ -106,8 +113,8 @@ class SINGERunner(Runner):
 
             cmdToRun = ' '.join(['docker run --rm --entrypoint /bin/sh',
                                 f"-v {self.working_dir}:/usr/working_dir",
-                                f'{self.image} -c \"echo \\"',
-                                 params_str, '\\" >', paramsFile, '&&', symlink_out_file, '&&', convert_input_to_matfile,
+                                f'{self.image} -c \"',
+                                 symlink_out_file, '&&', convert_input_to_matfile,
                                  '&& time -v -o', "/usr/working_dir/time" + str(idx) + ".txt",
                                  '/usr/local/SINGE/SINGE.sh /usr/local/MATLAB/MATLAB_Runtime/v94 standalone',
                                  inputMat, geneListMat, outFileSymlink, paramsFile, '\"'])
