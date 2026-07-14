@@ -1,4 +1,6 @@
-import os
+from pathlib import Path
+import shlex
+
 import pandas as pd
 
 from BLRun.runner import Runner
@@ -36,12 +38,34 @@ class GRNBoost2Runner(Runner):
         n_estimators = str(self.params.get('nEstimators', 5000))
         max_features = str(self.params.get('maxFeatures', 0.1))
 
+        # Keep the runner and its CLI entrypoint on the same version.  The
+        # published arboreto image predates these tuning flags, so relying on
+        # the copy baked into the image makes an updated runner fail against a
+        # stale image.  Mounting the repository copy also makes deployments
+        # safe when the Docker image has not yet been rebuilt.
+        arboreto_script = (
+            Path(__file__).resolve().parents[1]
+            / 'Algorithms' / 'ARBORETO' / 'runArboreto.py'
+        )
+        if not arboreto_script.is_file():
+            raise FileNotFoundError(
+                f'Arboreto entrypoint does not exist: {arboreto_script}'
+            )
+
+        working_dir_mount = shlex.quote(
+            f'{self.working_dir}:/usr/working_dir'
+        )
+        entrypoint_mount = shlex.quote(
+            f'{arboreto_script}:/runArboreto.py:ro'
+        )
+
         cmdToRun = ' '.join(['docker run --rm',
-                            f"-v {self.working_dir}:/usr/working_dir",
+                            f'-v {working_dir_mount}',
+                            f'-v {entrypoint_mount}',
                             '--expose=41269',
                             f'{self.image} /bin/sh -c \"time -v -o',
                             "/usr/working_dir/time.txt",
-                            'python runArboreto.py --algo=GRNBoost2',
+                            'python /runArboreto.py --algo=GRNBoost2',
                             '--inFile=/usr/working_dir/ExpressionData.csv',
                             '--outFile=/usr/working_dir/outFile.txt',
                             f'--learningRate={learning_rate}',
