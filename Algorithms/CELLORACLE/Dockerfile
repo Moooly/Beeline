@@ -34,7 +34,7 @@ RUN pip install --no-cache-dir --no-build-isolation velocyto==0.17.17
 
 # CellOracle pulls its own compatible scanpy/anndata. Do NOT force a newer scanpy
 # here — it would conflict with CellOracle's pandas<=1.5.3 pin.
-RUN pip install --no-cache-dir celloracle
+RUN pip install --no-cache-dir celloracle==0.20.0
 
 # gimmemotifs (a CellOracle dependency) imports pkg_resources at import time,
 # which newer setuptools removed. Pin a setuptools that still ships pkg_resources
@@ -48,3 +48,4 @@ COPY prefetch_base_grns.py /
 RUN python /prefetch_base_grns.py && chmod -R a+rX /root/.celloracle 2>/dev/null || true
 
 COPY runCellOracle.py /
+COPY runCellOraclePerturbation.py /
