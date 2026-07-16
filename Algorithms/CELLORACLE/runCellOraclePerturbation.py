@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 
+from perturbation_distributions import summarize_expression_distribution
+
 
 GRN_UNIT_COLUMN = "grn_unit"
 CLUSTER_COLUMN = "cluster"
@@ -321,6 +323,7 @@ def build_result(oracle, args: argparse.Namespace, model_reused: bool) -> dict:
     embedding = np.asarray(oracle.embedding)
     shifts = np.asarray(oracle.delta_embedding)
     random_shifts = np.asarray(oracle.delta_embedding_random)
+    shift_distances = np.linalg.norm(shifts - random_shifts, axis=1)
     clusters = oracle.adata.obs[CLUSTER_COLUMN].astype(str).to_numpy()
     cells = oracle.adata.obs_names.astype(str).to_numpy()
 
@@ -334,6 +337,7 @@ def build_result(oracle, args: argparse.Namespace, model_reused: bool) -> dict:
             "shift_y": shifts[:, 1],
             "random_shift_x": random_shifts[:, 0],
             "random_shift_y": random_shifts[:, 1],
+            "shift_distance": shift_distances,
         }
     )
     cell_table.to_csv(output_dir / "cell_shifts.csv", index=False)
@@ -396,6 +400,30 @@ def build_result(oracle, args: argparse.Namespace, model_reused: bool) -> dict:
         summary["top_genes"] = cluster_effects_by_cluster.get(summary["cluster"], [])[:5]
     pd.DataFrame(cluster_rows).to_csv(output_dir / "cluster_effects.csv", index=False)
 
+    gene_expression_distributions: list[dict] = []
+    for gene in affected.head(25)["gene"].astype(str):
+        gene_expression_distributions.append(
+            summarize_expression_distribution(
+                gene=gene,
+                baseline_values=original[gene].to_numpy(),
+                simulated_values=simulated[gene].to_numpy(),
+                scope_type="global",
+            )
+        )
+    for cluster_label, effects in cluster_effects_by_cluster.items():
+        cluster_mask = clusters == cluster_label
+        for effect in effects[:10]:
+            gene = str(effect["gene"])
+            gene_expression_distributions.append(
+                summarize_expression_distribution(
+                    gene=gene,
+                    baseline_values=original.loc[cluster_mask, gene].to_numpy(),
+                    simulated_values=simulated.loc[cluster_mask, gene].to_numpy(),
+                    scope_type="cluster",
+                    scope_label=cluster_label,
+                )
+            )
+
     point_ids = sampled_indices(len(cells), 3000)
     ood_warnings = ood[ood["Max_exceeding_ratio"] > 0.5]
     ood_warning_count = int(len(ood_warnings))
@@ -451,11 +479,14 @@ def build_result(oracle, args: argparse.Namespace, model_reused: bool) -> dict:
                 "gene": str(row.gene),
                 "mean_change": finite_float(row.mean_change),
                 "mean_absolute_change": finite_float(row.mean_absolute_change),
+                "original_mean": finite_float(row.original_mean),
+                "simulated_mean": finite_float(row.simulated_mean),
             }
             for row in affected.head(25).itertuples(index=False)
         ],
         "cluster_effects": cluster_rows,
         "cluster_summary": cluster_summaries,
+        "gene_expression_distributions": gene_expression_distributions,
         "embedding_points": [
             {
                 "x": finite_float(embedding[index, 0]),
