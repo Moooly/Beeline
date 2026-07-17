@@ -57,54 +57,89 @@ def parseArgs(args):
     parser.add_option('', '--learningRate', type='float', default=None,
                       help='GRNBoost2 only: boosting shrinkage / learning rate.')
 
+    parser.add_option('', '--nWorkers', type='int', default=1,
+                      help='Number of Dask target-gene workers.')
+
+    parser.add_option('', '--topK', type='int', default=0,
+                      help='Maximum regulators written per target (0 = all).')
+
     (opts, args) = parser.parse_args(args)
 
     return opts, args
+
+
+def limit_regulators_per_target(network, top_k):
+    """Reduce only the emitted edge table; inference remains unchanged."""
+    if top_k is None or int(top_k) <= 0 or network.empty:
+        return network
+    ordered = network.sort_values(
+        'importance', ascending=False, kind='stable'
+    )
+    return ordered.groupby('target', sort=False, group_keys=False).head(
+        int(top_k)
+    )
 
 def main(args):
     opts, args = parseArgs(args)
     inDF = pd.read_csv(opts.inFile, sep = '\t', index_col = 0, header = 0)
 
-    client = Client(processes = False)
+    worker_count = max(1, int(opts.nWorkers))
+    local_cluster = LocalCluster(
+        n_workers=worker_count,
+        threads_per_worker=1,
+        processes=False,
+        dashboard_address=None,
+    )
+    client = Client(local_cluster)
 
-    if opts.algo == 'GENIE3':
-        # float32: sklearn's tree code casts features to float32 for split-finding
-        # regardless, so passing float32 up front avoids a per-forest conversion and
-        # halves the matrix's memory. Reduced tree count is applied via
-        # GENIE3_RF_KWARGS; the call otherwise mirrors arboreto.algo.genie3 exactly.
-        rf_kwargs = dict(GENIE3_RF_KWARGS)
-        if opts.nEstimators is not None:
-            rf_kwargs['n_estimators'] = opts.nEstimators
-        if opts.maxFeatures is not None:
-            rf_kwargs['max_features'] = GENIE3_MAX_FEATURES_ALIASES.get(
-                opts.maxFeatures, opts.maxFeatures)
+    try:
+        if opts.algo == 'GENIE3':
+            # float32 avoids sklearn's repeated per-forest conversion.
+            rf_kwargs = dict(GENIE3_RF_KWARGS)
+            if opts.nEstimators is not None:
+                rf_kwargs['n_estimators'] = opts.nEstimators
+            if opts.maxFeatures is not None:
+                rf_kwargs['max_features'] = GENIE3_MAX_FEATURES_ALIASES.get(
+                    opts.maxFeatures, opts.maxFeatures)
 
-        expr = inDF.to_numpy(dtype=np.float32)
-        network = diy(expr, regressor_type='RF', regressor_kwargs=rf_kwargs,
-                      client_or_address=client, gene_names=inDF.columns)
-        network.to_csv(opts.outFile, index=False, sep='\t')
+            expr = inDF.to_numpy(dtype=np.float32)
+            network = diy(
+                expr,
+                regressor_type='RF',
+                regressor_kwargs=rf_kwargs,
+                client_or_address=client,
+                gene_names=inDF.columns,
+            )
+            network = limit_regulators_per_target(network, opts.topK)
+            network.to_csv(opts.outFile, index=False, sep='\t')
 
-    elif opts.algo == 'GRNBoost2':
-        # float32: same rationale as GENIE3 — sklearn's tree code casts features
-        # to float32 anyway, so this skips a per-tree conversion and halves the
-        # matrix's memory. With no overrides, diy(regressor_type='GBM', ...) plus
-        # the early-stopping window reproduces arboreto.algo.grnboost2 exactly.
-        gbm_kwargs = dict(GRNBOOST2_GBM_KWARGS)
-        if opts.learningRate is not None:
-            gbm_kwargs['learning_rate'] = opts.learningRate
-        if opts.nEstimators is not None:
-            gbm_kwargs['n_estimators'] = opts.nEstimators
-        if opts.maxFeatures is not None:
-            gbm_kwargs['max_features'] = float(opts.maxFeatures)
+        elif opts.algo == 'GRNBoost2':
+            # float32 avoids sklearn's repeated per-tree conversion.
+            gbm_kwargs = dict(GRNBOOST2_GBM_KWARGS)
+            if opts.learningRate is not None:
+                gbm_kwargs['learning_rate'] = opts.learningRate
+            if opts.nEstimators is not None:
+                gbm_kwargs['n_estimators'] = opts.nEstimators
+            if opts.maxFeatures is not None:
+                gbm_kwargs['max_features'] = float(opts.maxFeatures)
 
-        expr = inDF.to_numpy(dtype=np.float32)
-        network = diy(expr, regressor_type='GBM', regressor_kwargs=gbm_kwargs,
-                      client_or_address=client, gene_names=inDF.columns,
-                      early_stop_window_length=GRNBOOST2_EARLY_STOP_WINDOW_LENGTH)
-        network.to_csv(opts.outFile, index = False, sep = '\t')
+            expr = inDF.to_numpy(dtype=np.float32)
+            network = diy(
+                expr,
+                regressor_type='GBM',
+                regressor_kwargs=gbm_kwargs,
+                client_or_address=client,
+                gene_names=inDF.columns,
+                early_stop_window_length=GRNBOOST2_EARLY_STOP_WINDOW_LENGTH,
+            )
+            network = limit_regulators_per_target(network, opts.topK)
+            network.to_csv(opts.outFile, index=False, sep='\t')
 
-    else:
-        print("Wrong algorithm name. Should either be GENIE3 or GRNBoost2.")
+        else:
+            print("Wrong algorithm name. Should either be GENIE3 or GRNBoost2.")
+    finally:
+        client.close()
+        local_cluster.close()
 
 if __name__ == "__main__":
     main(sys.argv)

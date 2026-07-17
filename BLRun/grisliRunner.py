@@ -1,4 +1,7 @@
+import csv
 import os
+from pathlib import Path
+import shlex
 import pandas as pd
 import numpy as np
 
@@ -15,10 +18,12 @@ class GRISLIRunner(Runner):
         this function will not do anything.
         '''
 
-        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
+        PTData = self.read_pseudotime_data()
+        (self.working_dir / 'GeneList.txt').write_text(
+            '\n'.join(str(gene) for gene in ExpressionData.index) + '\n',
+            encoding='utf-8',
+        )
 
         colNames = PTData.columns
         for idx in range(len(colNames)):
@@ -45,24 +50,46 @@ class GRISLIRunner(Runner):
         L = str(self.params['L'])
         R = str(self.params['R'])
         alphaMin = str(self.params['alphaMin'])
+        top_k = self._resolve_top_k() or 0
+        compactor_path = (
+            Path(__file__).resolve().parents[1]
+            / 'Algorithms' / 'compactRankMatrix.awk'
+        )
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
+        commands = []
         for idx in range(len(colNames)):
             os.makedirs(str(self.working_dir / str(idx)), exist_ok = True)
+            output_path = (
+                "/usr/working_dir/" + str(idx) + "/outFile.txt"
+            )
+            algorithm_output_path = (
+                "/tmp/grisli-full.csv" if top_k else output_path
+            )
+            compact_command = (
+                " && awk"
+                f" -v top_k={top_k}"
+                " -v gene_file=/usr/working_dir/GeneList.txt"
+                f" -f /compactRankMatrix.awk {algorithm_output_path} > {output_path}"
+                if top_k
+                else ""
+            )
 
             cmdToRun = ' '.join(['docker run --rm',
-                                f"-v {self.working_dir}:/usr/working_dir",
+                                f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
+                                f"-v {shlex.quote(str(compactor_path))}:/compactRankMatrix.awk:ro",
                                 f'{self.image} /bin/sh -c \"time -v -o',
                                 "/usr/working_dir/time" + str(idx) + ".txt",
                                 './GRISLI',
                                 "/usr/working_dir/" + str(idx) + "/",
-                                "/usr/working_dir/" + str(idx) + "/outFile.txt",
-                                L, R, alphaMin, '\"'])
+                                algorithm_output_path,
+                                L, R, alphaMin + compact_command, '\"'])
 
-            self._run_docker(cmdToRun, append=(idx > 0))
+            commands.append(cmdToRun)
+
+        self._run_docker_batch(commands)
 
     def _resolve_top_k(self):
         '''
@@ -86,8 +113,7 @@ class GRISLIRunner(Runner):
         '''
         workDir = self.working_dir
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
         colNames = PTData.columns
 
         # Quit if any trajectory output is missing (matches original behaviour).
@@ -97,24 +123,47 @@ class GRISLIRunner(Runner):
                 return
 
         # read input file for list of gene names
-        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                     header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
         GeneList = list(ExpressionData.index)
 
         top_k = self._resolve_top_k()
 
-        # Bounded fast path: a single trajectory with a per-target cap. GRISLI's
-        # output is inherently a g x g rank matrix, but the full g^2 edge list
-        # need not be sorted/written: keep only the top-K regulators per target
-        # (matrix column). GRISLI encodes strength as EdgeWeight = g^2 - value,
-        # so the strongest edges are the *smallest* matrix values. With one
-        # trajectory there is no cross-trajectory max, so this is exact.
-        if top_k is not None and len(colNames) == 1:
-            self._parse_output_topk(workDir / '0/outFile.txt', GeneList, top_k)
+        if top_k is not None:
+            streams = (
+                self._iter_matrix_topk(
+                    workDir / (str(index) + '/outFile.txt'),
+                    GeneList,
+                    top_k,
+                )
+                for index in range(len(colNames))
+            )
+            self._write_ranked_edges(
+                self._merge_bounded_trajectory_edges(streams, top_k)
+            )
             return
 
         # General path: original full sort / cross-trajectory max.
         self._parse_output_full(workDir, colNames, GeneList)
+
+    @staticmethod
+    def _iter_matrix_topk(out_path, gene_list, top_k):
+        with out_path.open('r', newline='') as handle:
+            first_line = handle.readline()
+        if first_line.startswith('Gene1\tGene2\tEdgeWeight'):
+            with out_path.open('r', newline='') as handle:
+                reader = csv.DictReader(handle, delimiter='\t')
+                for row in reader:
+                    yield row['Gene1'], row['Gene2'], float(row['EdgeWeight'])
+            return
+        matrix = pd.read_csv(out_path, sep=',', header=None).values
+        n_rows, n_cols = matrix.shape
+        total = len(gene_list) * len(gene_list)
+        keep = min(top_k, n_rows)
+        for col in range(n_cols):
+            column = matrix[:, col]
+            candidate_rows = np.argsort(column, kind='stable')[:keep]
+            for row in candidate_rows:
+                yield gene_list[row], gene_list[col], total - column[row]
 
     def _parse_output_topk(self, out_path, GeneList, top_k):
         '''

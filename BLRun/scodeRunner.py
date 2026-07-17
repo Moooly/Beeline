@@ -15,10 +15,8 @@ class SCODERunner(Runner):
         this function will not do anything.
         '''
 
-        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
         for idx in range(len(colNames)):
@@ -49,10 +47,10 @@ class SCODERunner(Runner):
         nIter = str(self.params['nIter'])
         nRep = str(self.params['nRep'])
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
+        commands = []
 
         for idx in range(len(colNames)):
 
@@ -74,7 +72,9 @@ class SCODERunner(Runner):
                                 "/usr/working_dir/" + str(idx),
                                 nGenes, z, nCells, nIter, nRep, '\"'])
 
-            self._run_docker(cmdToRun, append=(idx > 0))
+            commands.append(cmdToRun)
+
+        self._run_docker_batch(commands)
 
     def parseOutput(self):
         '''
@@ -82,8 +82,7 @@ class SCODERunner(Runner):
         '''
         workDir = self.working_dir
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
         colNames = PTData.columns
 
         # Quit if any trajectory output is missing (matches original behaviour).
@@ -92,8 +91,7 @@ class SCODERunner(Runner):
                 print(str(workDir / (str(indx)+'/meanA.txt')) + ' does not exist, skipping...')
                 return
 
-        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                     header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
         GeneList = list(ExpressionData.index)
 
         top_k = self._resolve_top_k()

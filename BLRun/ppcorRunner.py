@@ -1,6 +1,8 @@
 import csv
 import heapq
 import os
+from pathlib import Path
+import shlex
 import shutil
 import pandas as pd
 
@@ -24,6 +26,12 @@ class PPCORRunner(Runner):
         PPCOR_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if PPCOR_EXPRESSION_FILE.exists():
             return
+        if (
+            getattr(self, 'expression_source', None) is not None
+            or getattr(self, 'selected_cells_file', None) is not None
+        ):
+            self.read_expression_data().to_csv(PPCOR_EXPRESSION_FILE)
+            return
         if not source_file.exists():
             raise FileNotFoundError(
                 f"Expression data file not found: {source_file}")
@@ -37,12 +45,21 @@ class PPCORRunner(Runner):
         Function to run PPCOR algorithm
         '''
 
+        script_path = (
+            Path(__file__).resolve().parents[1]
+            / 'Algorithms' / 'PPCOR' / 'runPPCOR.R'
+        )
+        top_k = self._resolve_top_k() or 0
+        p_value_cutoff = str(self.params['pVal'])
         cmdToRun = ' '.join(['docker run --rm',
-                            f"-v {self.working_dir}:/usr/working_dir",
+                            f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
+                            f"-v {shlex.quote(str(script_path))}:/runPPCOR.R:ro",
                             f'{self.image} /bin/sh -c \"time -v -o',
                             "/usr/working_dir/time.txt",
-                            'Rscript runPPCOR.R',
-                            "/usr/working_dir/ExpressionData.csv", "/usr/working_dir/outFile.txt", '\"'])
+                            'Rscript /runPPCOR.R',
+                            "/usr/working_dir/ExpressionData.csv",
+                            "/usr/working_dir/outFile.txt",
+                            p_value_cutoff, str(top_k), '\"'])
 
         # Run command
         self._run_docker(cmdToRun)
@@ -79,6 +96,14 @@ class PPCORRunner(Runner):
 
         p_val_cutoff = float(self.params['pVal'])
         top_k = self._resolve_top_k()
+
+        header = pd.read_csv(outFile, sep='\t', nrows=0).columns
+        if 'EdgeWeight' in header:
+            compact = pd.read_csv(outFile, sep='\t')
+            self._write_ranked_edges(
+                compact[['Gene1', 'Gene2', 'EdgeWeight']]
+            )
+            return
 
         if top_k is None:
             # No per-target cap (e.g. standalone BEELINE): reproduce the original

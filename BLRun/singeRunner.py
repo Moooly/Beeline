@@ -16,10 +16,8 @@ class SINGERunner(Runner):
         this function will not do anything.
         '''
 
-        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
         for idx in range(len(colNames)):
@@ -77,10 +75,10 @@ class SINGERunner(Runner):
             encoding='utf-8',
         )
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
+        commands = []
         for idx in range(len(colNames)):
             os.makedirs(str(self.working_dir / str(idx)), exist_ok = True)
 
@@ -119,7 +117,9 @@ class SINGERunner(Runner):
                                  '/usr/local/SINGE/SINGE.sh /usr/local/MATLAB/MATLAB_Runtime/v94 standalone',
                                  inputMat, geneListMat, outFileSymlink, paramsFile, '\"'])
 
-            self._run_docker(cmdToRun, append=(idx > 0))
+            commands.append(cmdToRun)
+
+        self._run_docker_batch(commands)
 
     def parseOutput(self):
         '''
@@ -127,8 +127,7 @@ class SINGERunner(Runner):
         '''
         workDir = self.working_dir
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
 

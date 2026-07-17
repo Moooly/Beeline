@@ -1,6 +1,8 @@
 import csv
 import heapq
 import os
+from pathlib import Path
+import shlex
 import pandas as pd
 import numpy as np
 
@@ -17,10 +19,8 @@ class LEAPRunner(Runner):
         this function will not do anything.
         '''
 
-        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
         for idx in range(len(colNames)):
@@ -49,22 +49,31 @@ class LEAPRunner(Runner):
         '''
 
         maxLag = str(self.params['maxLag'])
+        top_k = str(self._resolve_top_k() or 0)
+        script_path = (
+            Path(__file__).resolve().parents[1]
+            / 'Algorithms' / 'LEAP' / 'runLeap.R'
+        )
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
+        commands = []
         for idx in range(len(colNames)):
             cmdToRun = ' '.join(['docker run --rm',
-                                f"-v {self.working_dir}:/usr/working_dir",
+                                f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
+                                f"-v {shlex.quote(str(script_path))}:/runLeap.R:ro",
                                 f'{self.image} /bin/sh -c \"time -v -o',
                                 "/usr/working_dir/time" + str(idx) + ".txt",
-                                'Rscript runLeap.R',
+                                'Rscript /runLeap.R',
                                 "/usr/working_dir/ExpressionData" + str(idx) + ".csv",
                                 maxLag,
-                                "/usr/working_dir/outFile" + str(idx) + ".txt", '\"'])
+                                "/usr/working_dir/outFile" + str(idx) + ".txt",
+                                top_k, '\"'])
 
-            self._run_docker(cmdToRun, append=(idx > 0))
+            commands.append(cmdToRun)
+
+        self._run_docker_batch(commands)
 
     def _resolve_top_k(self):
         '''
@@ -90,8 +99,7 @@ class LEAPRunner(Runner):
         '''
         workDir = self.working_dir
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
         outFileNames = ['outFile' + str(indx) + '.txt' for indx in range(len(colNames))]
@@ -104,16 +112,30 @@ class LEAPRunner(Runner):
 
         top_k = self._resolve_top_k()
 
-        # Bounded fast path: a single trajectory with a per-target cap. With one
-        # trajectory there is no cross-trajectory max, so keeping only the top-K
-        # edges per target (by |Score|) in a heap is exact and never loads the
-        # full g^2 edge list into memory.
-        if top_k is not None and len(colNames) == 1:
-            self._parse_output_topk(workDir / outFileNames[0], top_k)
+        if top_k is not None:
+            merged = self._merge_bounded_trajectory_edges(
+                (
+                    self._iter_output_edges(workDir / out_file_name)
+                    for out_file_name in outFileNames
+                ),
+                top_k,
+            )
+            self._write_ranked_edges(merged)
             return
 
         # General path: full parse across all trajectories (cross-trajectory max).
         self._parse_output_full(workDir, outFileNames)
+
+    @staticmethod
+    def _iter_output_edges(out_path):
+        with out_path.open('r', newline='') as handle:
+            reader = csv.DictReader(handle, delimiter='\t')
+            for row in reader:
+                try:
+                    score = abs(float(row['Score']))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                yield row.get('Gene1', ''), row.get('Gene2', ''), score
 
     def _parse_output_topk(self, out_path, top_k):
         '''

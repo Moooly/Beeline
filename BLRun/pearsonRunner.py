@@ -33,9 +33,9 @@ class PearsonRunner(Runner):
         :param self.exprData: str — expression data filename
         :raises FileNotFoundError: if the expression data file is missing
         '''
-        if not (self.input_dir / self.exprData).exists():
+        if not self.expression_input_path().exists():
             raise FileNotFoundError(
-                f"Expression data file not found: {self.input_dir / self.exprData}")
+                f"Expression data file not found: {self.expression_input_path()}")
 
     def _resolve_top_k(self, n_genes):
         '''
@@ -94,8 +94,7 @@ class PearsonRunner(Runner):
             Gene1 (source), Gene2 (target), EdgeWeight (signed Pearson r)
         '''
         # Read expression data: rows = genes, columns = cells
-        ExpressionData = pd.read_csv(
-            self.input_dir / self.exprData, header=0, index_col=0)
+        ExpressionData = self.read_expression_data()
         if not isinstance(ExpressionData, pd.DataFrame):
             raise TypeError(f"ExpressionData must be a DataFrame, got {type(ExpressionData)}")
 

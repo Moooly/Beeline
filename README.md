@@ -15,15 +15,22 @@ bash utils/setupAnacondaVENV.sh
 
 **2. Pull algorithm Docker images**
 
-`utils/initialize.sh` manages Docker images for all supported BEELINE algorithms. By default it pulls pre-built images from the [grnbeeline DockerHub organisation](https://hub.docker.com/u/grnbeeline). Pass `--build` to build images locally from source in `Algorithms/` instead.
+`utils/initialize.sh` manages Docker images for all supported BEELINE algorithms. By default it pulls tested published images and builds the locally modified images. Pass `--build` to build every managed image locally from the Dockerfiles under `Algorithms/` with one command.
 
 ```bash
 bash utils/initialize.sh [OPTIONS]
 ```
 
+To build every managed algorithm image locally in one invocation:
+
+```bash
+bash utils/initialize.sh --build
+```
+
 | Flag | Description |
 |------|-------------|
-| `-b` / `--build` | Build images locally from source instead of pulling from DockerHub. |
+| `-b` / `--build` | Build every managed image locally from source instead of pulling from DockerHub. |
+| `--build-all` | Alias for `--build`. |
 | `-v` / `--verbose` | Enable verbose Docker output. |
 | `--remove-local-images` | Remove locally built BEELINE images. If combined with `--build`, images are removed then rebuilt. |
 | `--remove-grnbeeline-images` | Remove pulled DockerHub (grnbeeline) images. If combined with `--build`, images are removed then rebuilt. |

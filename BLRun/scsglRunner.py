@@ -18,8 +18,7 @@ class SCSGLRunner(Runner):
         SCSGL_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if not SCSGL_EXPRESSION_FILE.exists():
             # input data
-            ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
+            ExpressionData = self.read_expression_data()
 
             # Write gene expression data in SCSGL folder
             ExpressionData.to_csv(SCSGL_EXPRESSION_FILE,

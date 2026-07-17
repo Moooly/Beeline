@@ -19,8 +19,7 @@ class GRNBoost2Runner(Runner):
         # Create ExpressionData.csv file in the created input directory
         GRNBOOST2_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if not GRNBOOST2_EXPRESSION_FILE.exists():
-            ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
+            ExpressionData = self.read_expression_data()
 
             # Write .csv file
             ExpressionData.T.to_csv(GRNBOOST2_EXPRESSION_FILE,
@@ -37,6 +36,7 @@ class GRNBoost2Runner(Runner):
         learning_rate = str(self.params.get('learningRate', 0.01))
         n_estimators = str(self.params.get('nEstimators', 5000))
         max_features = str(self.params.get('maxFeatures', 0.1))
+        top_k = str(self.params.get('maxRegulatorsPerTarget', 0))
 
         # Keep the runner and its CLI entrypoint on the same version.  The
         # published arboreto image predates these tuning flags, so relying on
@@ -70,7 +70,9 @@ class GRNBoost2Runner(Runner):
                             '--outFile=/usr/working_dir/outFile.txt',
                             f'--learningRate={learning_rate}',
                             f'--nEstimators={n_estimators}',
-                            f'--maxFeatures={max_features}', '\"'])
+                            f'--maxFeatures={max_features}',
+                            f'--topK={top_k}',
+                            f'--nWorkers={getattr(self, "cpu_budget", 1)}', '\"'])
 
         self._run_docker(cmdToRun)
 

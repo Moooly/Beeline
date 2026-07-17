@@ -17,6 +17,7 @@ import celloracle as co
 import numpy as np
 import pandas as pd
 import scanpy as sc
+from celloracle.applications import Gradient_calculator, Oracle_development_module
 
 from perturbation_distributions import summarize_expression_distribution
 
@@ -31,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expression", required=True)
     parser.add_argument("--edges", required=True)
     parser.add_argument("--clusters")
+    parser.add_argument("--pseudotime")
     parser.add_argument("--cluster-edges-manifest")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -298,6 +300,252 @@ def sampled_indices(length: int, limit: int) -> np.ndarray:
     if length <= limit:
         return np.arange(length)
     return np.linspace(0, length - 1, limit, dtype=int)
+
+
+PSEUDOTIME_KEY = "GRNScopePseudotime"
+PSEUDOTIME_MISSING_TOKENS = {"", "na", "nan", "null", "none"}
+CELL_ID_HEADERS = {"cell", "cell_id", "cellid", "cell id", "cells"}
+
+
+def optional_finite_float(value: object) -> float | None:
+    text = str(value).strip()
+    if text.lower() in PSEUDOTIME_MISSING_TOKENS:
+        return None
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def unique_trajectory_names(raw_names: list[str]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for index, raw_name in enumerate(raw_names, start=1):
+        base = str(raw_name).strip() or f"PseudoTime{index}"
+        name = base
+        suffix = 2
+        while name in seen:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        names.append(name)
+        seen.add(name)
+    return names
+
+
+def read_pseudotime_trajectories(
+    path: Path,
+    expression_cell_ids: list[str],
+) -> dict[str, dict[str, float]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        sample = handle.read(65536)
+        handle.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+        except csv.Error:
+            dialect = csv.excel
+        rows = [
+            [str(value).strip() for value in row]
+            for row in csv.reader(handle, dialect=dialect)
+            if any(str(value).strip() for value in row)
+        ]
+
+    if not rows:
+        raise ValueError("Pseudotime file is empty.")
+
+    if len(rows[0]) == 1:
+        first_is_value = optional_finite_float(rows[0][0]) is not None
+        name = "Pseudotime" if first_is_value else (rows[0][0] or "Pseudotime")
+        data_rows = rows if first_is_value else rows[1:]
+        if len(data_rows) != len(expression_cell_ids):
+            raise ValueError("Pseudotime row count does not match the expression cells.")
+        values: dict[str, float] = {}
+        for cell_id, row in zip(expression_cell_ids, data_rows):
+            value = optional_finite_float(row[0] if row else "")
+            if value is None:
+                raise ValueError("Single-column pseudotime contains a missing value.")
+            values[cell_id] = value
+        return {name: values}
+
+    headers = rows[0]
+    data_rows = rows[1:]
+    first_data_width = len(data_rows[0]) if data_rows else len(headers)
+    explicit_cell_header = headers[0].strip().lower() in CELL_ID_HEADERS or headers[0] == ""
+    shifted_headers = (
+        not explicit_cell_header
+        and (
+            first_data_width == len(headers) + 1
+            or (headers[-1] == "" and first_data_width == len(headers))
+        )
+    )
+    if shifted_headers:
+        raw_trajectory_names = (
+            headers[:-1]
+            if headers[-1] == "" and first_data_width == len(headers)
+            else headers
+        )
+        expected_width = len(headers) if headers[-1] == "" else len(headers) + 1
+    else:
+        raw_trajectory_names = headers[1:]
+        expected_width = len(headers)
+
+    trajectory_names = unique_trajectory_names(raw_trajectory_names)
+    trajectories = {name: {} for name in trajectory_names}
+    for row in data_rows:
+        padded = [*row, *([""] * max(0, expected_width - len(row)))]
+        cell_id = padded[0].strip()
+        if not cell_id:
+            continue
+        for name, raw_value in zip(trajectory_names, padded[1 : len(trajectory_names) + 1]):
+            value = optional_finite_float(raw_value)
+            if value is not None:
+                trajectories[name][cell_id] = value
+    return trajectories
+
+
+def load_best_pseudotime_trajectory(
+    oracle,
+    pseudotime_path: Path,
+    expression_path: Path,
+) -> tuple[str, np.ndarray]:
+    expression_headers = pd.read_csv(
+        expression_path,
+        sep=None,
+        engine="python",
+        nrows=0,
+        index_col=0,
+    )
+    expression_cell_ids = [str(cell_id) for cell_id in expression_headers.columns]
+    trajectories = read_pseudotime_trajectories(pseudotime_path, expression_cell_ids)
+    oracle_cell_ids = [str(cell_id) for cell_id in oracle.adata.obs_names]
+    ranked = sorted(
+        trajectories.items(),
+        key=lambda item: -sum(cell_id in item[1] for cell_id in oracle_cell_ids),
+    )
+    if not ranked:
+        raise ValueError("Pseudotime file contains no trajectories.")
+    trajectory_name, values_by_cell = ranked[0]
+    pseudotime = np.asarray(
+        [values_by_cell.get(cell_id, np.nan) for cell_id in oracle_cell_ids],
+        dtype=float,
+    )
+    usable_indices = np.flatnonzero(np.isfinite(pseudotime))
+    if len(usable_indices) < 20:
+        raise ValueError("Pseudotime trajectory has fewer than 20 analyzed cells.")
+    oracle.adata.obs[PSEUDOTIME_KEY] = pseudotime
+    return trajectory_name, usable_indices
+
+
+def unavailable_ps_metrics(reason: str) -> dict:
+    return {
+        "perturbation_score": None,
+        "perturbation_score_p_value": None,
+        "perturbation_score_direction": None,
+        "perturbation_score_grid_point_count": 0,
+        "perturbation_score_unavailable_reason": reason,
+    }
+
+
+def calculate_ps_metrics(oracle, cell_indices: np.ndarray, n_jobs: int) -> dict:
+    if len(cell_indices) < 20:
+        return unavailable_ps_metrics("Too few cells have pseudotime in this scope.")
+
+    n_neighbors = int(min(200, max(2, len(cell_indices) - 2)))
+    gradient = Gradient_calculator(
+        oracle_object=oracle,
+        pseudotime_key=PSEUDOTIME_KEY,
+        cell_idx_use=cell_indices,
+    )
+    gradient.calculate_p_mass(
+        smooth=0.8,
+        n_grid=40,
+        n_neighbors=n_neighbors,
+        n_jobs=n_jobs,
+    )
+    gradient.calculate_mass_filter(min_mass=0.01, plot=False)
+    gradient.transfer_data_into_grid(args={"method": "polynomial", "n_poly": 3})
+    gradient.calculate_gradient()
+
+    development = Oracle_development_module()
+    development.load_differentiation_reference_data(gradient_object=gradient)
+    development.load_perturb_simulation_data(
+        oracle_object=oracle,
+        cell_idx_use=cell_indices,
+        n_neighbors=n_neighbors,
+    )
+    development.calculate_inner_product()
+    development.calculate_digitized_ip(n_bins=10)
+
+    scores = development.inner_product_df["score"].to_numpy(dtype=float)
+    scores = scores[np.isfinite(scores)]
+    if len(scores) < 2:
+        return unavailable_ps_metrics("Too few valid grid points for Perturbation Score.")
+
+    perturbation_score = float(scores.mean())
+    if perturbation_score > 0:
+        direction = "promotes"
+        p_value = development.get_positive_PS_p_value()
+    elif perturbation_score < 0:
+        direction = "blocks"
+        p_value = development.get_negative_PS_p_value()
+    else:
+        direction = "neutral"
+        p_value = None
+
+    p_value = optional_finite_float(p_value) if p_value is not None else None
+    return {
+        "perturbation_score": perturbation_score,
+        "perturbation_score_p_value": p_value,
+        "perturbation_score_direction": direction,
+        "perturbation_score_grid_point_count": int(len(scores)),
+        "perturbation_score_unavailable_reason": (
+            None if p_value is not None else "The paired Wilcoxon test could not be calculated."
+        ),
+    }
+
+
+def attach_perturbation_score_metrics(
+    result: dict,
+    oracle,
+    args: argparse.Namespace,
+) -> None:
+    if not args.pseudotime:
+        result.update(unavailable_ps_metrics("Pseudotime was not uploaded for this project."))
+        for summary in result.get("cluster_summary", []):
+            summary.update(unavailable_ps_metrics("Pseudotime was not uploaded for this project."))
+        return
+
+    try:
+        trajectory_name, trajectory_indices = load_best_pseudotime_trajectory(
+            oracle,
+            Path(args.pseudotime),
+            Path(args.expression),
+        )
+    except Exception as exc:
+        reason = f"Pseudotime could not be used: {exc}"
+        result.update(unavailable_ps_metrics(reason))
+        for summary in result.get("cluster_summary", []):
+            summary.update(unavailable_ps_metrics(reason))
+        return
+
+    result["pseudotime_trajectory"] = trajectory_name
+    result["pseudotime_cell_count"] = int(len(trajectory_indices))
+    try:
+        result.update(calculate_ps_metrics(oracle, trajectory_indices, args.n_jobs))
+    except Exception as exc:
+        result.update(unavailable_ps_metrics(f"Perturbation Score calculation failed: {exc}"))
+
+    clusters = oracle.adata.obs[CLUSTER_COLUMN].astype(str).to_numpy()
+    trajectory_mask = np.zeros(len(clusters), dtype=bool)
+    trajectory_mask[trajectory_indices] = True
+    for summary in result.get("cluster_summary", []):
+        cluster_indices = np.flatnonzero(
+            trajectory_mask & (clusters == str(summary.get("cluster", "")))
+        )
+        try:
+            summary.update(calculate_ps_metrics(oracle, cluster_indices, args.n_jobs))
+        except Exception as exc:
+            summary.update(unavailable_ps_metrics(f"Perturbation Score calculation failed: {exc}"))
 
 
 def build_result(oracle, args: argparse.Namespace, model_reused: bool) -> dict:
@@ -580,6 +828,7 @@ def main() -> None:
     args.grid_n_neighbors = neighbor_count
 
     result = build_result(oracle, args, model_reused)
+    attach_perturbation_score_metrics(result, oracle, args)
     output_path = Path(args.output_dir) / "result.json"
     output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"CellOracle perturbation result written to {output_path}")

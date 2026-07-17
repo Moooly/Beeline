@@ -18,11 +18,9 @@ class JUMP3Runner(Runner):
         # Create ExpressionData.csv file in the created input directory
         JUMP3_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if not JUMP3_EXPRESSION_FILE.exists():
-            ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
+            ExpressionData = self.read_expression_data()
             newExpressionData = ExpressionData.T.copy()
-            PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                                 header = 0, index_col = 0)
+            PTData = self.read_pseudotime_data()
             # make sure the indices are strings for both dataframes
             newExpressionData.index = newExpressionData.index.map(str)
             PTData.index = PTData.index.map(str)
@@ -77,8 +75,7 @@ class JUMP3Runner(Runner):
         DFSorted = OutMatrix[rows, cols]
 
         # read input file for list of gene names
-        ExpressionData = pd.read_csv(self.input_dir / 'ExpressionData.csv',
-                                         header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
         GeneList = list(ExpressionData.index)
 
         self._write_ranked_edges(pd.DataFrame({

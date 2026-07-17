@@ -31,6 +31,7 @@ class ArboretoRunnerCommandTests(unittest.TestCase):
         self.assertIn('python /runArboreto.py --algo=GENIE3', command)
         self.assertIn('--nEstimators=250', command)
         self.assertIn('--maxFeatures=log2', command)
+        self.assertIn('--topK=0', command)
         self.assertIn(':/runArboreto.py:ro', command)
         self.assertIn(
             f'-v {shlex.quote(f"{working_dir}:/usr/working_dir")}',
@@ -51,6 +52,7 @@ class ArboretoRunnerCommandTests(unittest.TestCase):
         self.assertIn('--learningRate=0.05', command)
         self.assertIn('--nEstimators=750', command)
         self.assertIn('--maxFeatures=0.25', command)
+        self.assertIn('--topK=0', command)
         self.assertIn(':/runArboreto.py:ro', command)
 
 

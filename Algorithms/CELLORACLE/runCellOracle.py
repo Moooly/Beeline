@@ -6,22 +6,29 @@ upstream by GRNScope, which passes one cluster's cells at a time), and writes a
 ranked directed/signed edge list.
 
 Pipeline (CellOracle standard):
-  expression -> AnnData -> scanpy preprocessing (normalize/log/PCA/neighbors/UMAP)
-  -> Oracle.import_anndata_as_raw_count + import_TF_data(base GRN)
+  expression -> AnnData -> Oracle.import_anndata_as_raw_count
+  -> import_TF_data(base GRN)
   -> perform_PCA + knn_imputation -> get_links -> filter by p-value -> edge list
 
 The base GRN is a species-specific promoter network (or the mouse scATAC atlas),
 loaded from CellOracle's bundled data (baked into the image at build time).
 """
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
+from functools import lru_cache
+import json
 import os
+from pathlib import Path
+import resource
 import sys
+import time
+import traceback
 
 import numpy as np
 import pandas as pd
-import scanpy as sc
 import anndata as ad
 import celloracle as co
+import scanpy as sc
 
 
 # Species -> CellOracle built-in promoter base-GRN loader. Keys match the
@@ -42,17 +49,38 @@ PROMOTER_BASE_GRN_LOADERS = {
 GRN_UNIT_COLUMN = "grn_unit"
 
 
-def load_base_grn(species: str, base_grn: str) -> pd.DataFrame:
-    """Load the base GRN prior for the requested species / mode."""
+@lru_cache(maxsize=2)
+def _load_tf_dictionary_cached(species: str, base_grn: str) -> dict:
+    """Load and convert one base GRN per persistent worker/species/mode.
+
+    This mirrors ``Oracle.import_TF_data(TF_info_matrix=...)`` exactly. Passing
+    the cached dictionary on warm requests avoids copying and regrouping the
+    full promoter matrix each time.
+    """
     if base_grn == "mouse_scATAC_atlas":
         if species != "mouse":
             raise ValueError("mouse_scATAC_atlas base GRN is only available for mouse.")
-        return co.data.load_mouse_scATAC_atlas_base_GRN()
+        base_grn_frame = co.data.load_mouse_scATAC_atlas_base_GRN()
+    else:
+        loader = PROMOTER_BASE_GRN_LOADERS.get(species)
+        if loader is None:
+            raise ValueError(f"No built-in CellOracle base GRN for species '{species}'.")
+        base_grn_frame = loader()
 
-    loader = PROMOTER_BASE_GRN_LOADERS.get(species)
-    if loader is None:
-        raise ValueError(f"No built-in CellOracle base GRN for species '{species}'.")
-    return loader()
+    grouped = (
+        base_grn_frame.drop(["peak_id"], axis=1)
+        .groupby(by="gene_short_name")
+        .sum()
+    )
+    return dict(
+        grouped.apply(lambda column: column[column > 0].index.values, axis=1)
+    )
+
+
+def load_tf_dictionary(species: str, base_grn: str) -> dict:
+    """Return a shallow mapping copy so each Oracle owns its TF dictionary."""
+    normalized_mode = "promoter" if base_grn in {"auto", "promoter"} else base_grn
+    return _load_tf_dictionary_cached(species, normalized_mode).copy()
 
 
 def parse_args(argv):
@@ -85,42 +113,48 @@ def build_anndata(expression: pd.DataFrame, max_genes: int, max_cells: int) -> a
     )
 
     if max_cells and adata.n_obs > max_cells:
+        # Retain CellOracle's existing deterministic maxCells selection exactly.
         sc.pp.subsample(adata, n_obs=max_cells, random_state=0)
     return adata
 
 
 def preprocess_for_celloracle(adata: ad.AnnData):
-    # Keep raw counts; CellOracle re-imports them via import_anndata_as_raw_count.
-    adata.layers["raw_count"] = adata.X.copy()
+    """Attach only metadata required by Oracle's raw-count import.
 
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-    adata.raw = adata
-    sc.pp.scale(adata)
-
+    Oracle performs its own log normalization, PCA, and KNN imputation.  The
+    former Scanpy normalization/PCA/neighbors/UMAP pass was therefore repeated
+    work: its only consumed result was the two-dimensional visualization
+    embedding.  A deterministic circular placeholder preserves that API
+    contract without entering the GRN inference calculations.
+    """
     n_comps = int(min(50, adata.n_obs - 1, adata.n_vars - 1))
     n_comps = max(2, n_comps)
-    sc.tl.pca(adata, n_comps=n_comps, svd_solver="arpack")
-    sc.pp.neighbors(adata, n_neighbors=int(min(15, max(2, adata.n_obs - 1))), n_pcs=n_comps)
-    sc.tl.umap(adata)
 
     # One GRN unit for this scope (per-cluster scoping is done upstream).
     adata.obs[GRN_UNIT_COLUMN] = "unit"
     adata.obs[GRN_UNIT_COLUMN] = adata.obs[GRN_UNIT_COLUMN].astype("category")
+    angles = np.linspace(0.0, 2.0 * np.pi, adata.n_obs, endpoint=False)
+    adata.obsm["X_grnscope"] = np.column_stack(
+        (np.cos(angles), np.sin(angles))
+    ).astype(np.float32)
+    return adata, n_comps, "X_grnscope"
 
-    # Restore raw counts to X for CellOracle's import step.
-    adata.X = adata.layers["raw_count"].copy()
-    return adata, n_comps
 
-
-def infer_links(adata: ad.AnnData, base_grn: pd.DataFrame, n_comps: int, alpha: float, n_jobs: int):
+def infer_links(
+    adata: ad.AnnData,
+    tf_dictionary: dict,
+    n_comps: int,
+    embedding_name: str,
+    alpha: float,
+    n_jobs: int,
+):
     oracle = co.Oracle()
     oracle.import_anndata_as_raw_count(
         adata=adata,
         cluster_column_name=GRN_UNIT_COLUMN,
-        embedding_name="X_umap",
+        embedding_name=embedding_name,
     )
-    oracle.import_TF_data(TF_info_matrix=base_grn)
+    oracle.import_TF_data(TFdict=tf_dictionary)
     oracle.perform_PCA()
 
     n_cell = oracle.adata.shape[0]
@@ -167,22 +201,141 @@ def extract_edges(links, p_value_cutoff: float, top_k: int) -> pd.DataFrame:
     })
 
 
-def main(argv):
-    args = parse_args(argv)
-
+def execute_inference(args):
     expression = pd.read_csv(args.inFile, index_col=0)
     if expression.empty:
         raise ValueError("Expression matrix is empty.")
 
     adata = build_anndata(expression, args.maxGenes, args.maxCells)
-    adata, n_comps = preprocess_for_celloracle(adata)
+    adata, n_comps, embedding_name = preprocess_for_celloracle(adata)
 
-    base_grn = load_base_grn(args.species, args.baseGrn)
-    links = infer_links(adata, base_grn, n_comps, args.alpha, args.nJobs)
+    cache_hits_before = _load_tf_dictionary_cached.cache_info().hits
+    tf_dictionary = load_tf_dictionary(args.species, args.baseGrn)
+    prior_cache_hit = (
+        _load_tf_dictionary_cached.cache_info().hits > cache_hits_before
+    )
+    links = infer_links(
+        adata,
+        tf_dictionary,
+        n_comps,
+        embedding_name,
+        args.alpha,
+        args.nJobs,
+    )
     ranked = extract_edges(links, args.pValueCutoff, args.topK)
 
     ranked.to_csv(args.outFile, sep="\t", header=True, index=False)
     print(f"CellOracle wrote {len(ranked)} edges to {args.outFile}")
+    return {
+        "edge_count": int(len(ranked)),
+        "prior_cache_hit": prior_cache_hit,
+        "preprocessing_mode": "oracle_native_with_metadata_embedding",
+    }
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _format_elapsed(seconds: float) -> str:
+    minutes, remaining_seconds = divmod(max(0.0, seconds), 60.0)
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours}:{minutes:02d}:{remaining_seconds:05.2f}"
+
+
+def _write_time_metrics(
+    path: Path,
+    *,
+    started_at: float,
+    usage_before,
+    usage_after,
+) -> None:
+    elapsed = time.perf_counter() - started_at
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                f"User time (seconds): {max(0.0, usage_after.ru_utime - usage_before.ru_utime):.6f}",
+                f"System time (seconds): {max(0.0, usage_after.ru_stime - usage_before.ru_stime):.6f}",
+                f"Elapsed (wall clock) time (h:mm:ss or m:ss): {_format_elapsed(elapsed)}",
+                f"Maximum resident set size (kbytes): {int(usage_after.ru_maxrss)}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def run_worker() -> None:
+    """Accept JSON-line requests while keeping CellOracle and priors resident."""
+    request_index = 0
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+
+        request_index += 1
+        request = {}
+        response_path = None
+        log_path = None
+        started_at = time.perf_counter()
+        usage_before = resource.getrusage(resource.RUSAGE_SELF)
+        try:
+            request = json.loads(raw_line)
+            response_path = Path(request["responseFile"])
+            log_path = Path(request["logFile"])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            args = parse_args(request["argv"])
+            with log_path.open("w", encoding="utf-8") as log_file:
+                with redirect_stdout(log_file), redirect_stderr(log_file):
+                    telemetry = execute_inference(args)
+            response = {
+                "status": "Completed",
+                "request_id": request.get("request_id"),
+                "worker_pid": os.getpid(),
+                "request_index": request_index,
+                "elapsed_seconds": round(time.perf_counter() - started_at, 6),
+                **telemetry,
+            }
+        except Exception as exc:
+            if log_path is not None:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as log_file:
+                    traceback.print_exc(file=log_file)
+            else:
+                traceback.print_exc()
+            response = {
+                "status": "Failed",
+                "request_id": request.get("request_id"),
+                "worker_pid": os.getpid(),
+                "request_index": request_index,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "elapsed_seconds": round(time.perf_counter() - started_at, 6),
+            }
+
+        usage_after = resource.getrusage(resource.RUSAGE_SELF)
+        time_file_value = request.get("timeFile")
+        if time_file_value:
+            _write_time_metrics(
+                Path(time_file_value),
+                started_at=started_at,
+                usage_before=usage_before,
+                usage_after=usage_after,
+            )
+        if response_path is not None:
+            _write_json_atomic(response_path, response)
+
+
+def main(argv):
+    if "--worker" in argv:
+        run_worker()
+        return
+    args = parse_args(argv)
+    execute_inference(args)
 
 
 if __name__ == "__main__":

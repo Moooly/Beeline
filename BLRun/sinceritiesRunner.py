@@ -1,6 +1,8 @@
 import csv
 import heapq
 import os
+from pathlib import Path
+import shlex
 import pandas as pd
 
 from BLRun.runner import Runner
@@ -16,10 +18,8 @@ class SINCERITIESRunner(Runner):
         this function will not do anything.
         '''
 
-        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
         for idx in range(len(colNames)):
@@ -43,20 +43,29 @@ class SINCERITIESRunner(Runner):
         Function to run SINCERITIES algorithm
         '''
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
+        top_k = str(self._resolve_top_k() or 0)
+        script_path = (
+            Path(__file__).resolve().parents[1]
+            / 'Algorithms' / 'SINCERITIES' / 'runSinceritiesGRNScope.R'
+        )
 
         colNames = PTData.columns
+        commands = []
         for idx in range(len(colNames)):
             cmdToRun = ' '.join(['docker run --rm',
-                                f"-v {self.working_dir}:/usr/working_dir",
+                                f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
+                                f"-v {shlex.quote(str(script_path))}:/SINCERITIES/runSinceritiesGRNScope.R:ro",
                                 f'{self.image} /bin/sh -c \"time -v -o',
                                 "/usr/working_dir/time" + str(idx) + ".txt",
-                                'Rscript MAIN.R',
+                                'Rscript runSinceritiesGRNScope.R',
                                 "/usr/working_dir/ExpressionData" + str(idx) + ".csv",
-                                "/usr/working_dir/outFile" + str(idx) + ".txt", '\"'])
+                                "/usr/working_dir/outFile" + str(idx) + ".txt",
+                                top_k, '\"'])
 
-            self._run_docker(cmdToRun, append=(idx > 0))
+            commands.append(cmdToRun)
+
+        self._run_docker_batch(commands)
 
     def _resolve_top_k(self):
         '''
@@ -80,8 +89,7 @@ class SINCERITIESRunner(Runner):
         '''
         workDir = self.working_dir
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
         colNames = PTData.columns
 
         # Quit if any trajectory output is missing (matches original behaviour).
@@ -92,16 +100,37 @@ class SINCERITIESRunner(Runner):
 
         top_k = self._resolve_top_k()
 
-        # Bounded fast path: a single trajectory with a per-target cap. With one
-        # trajectory there is no cross-trajectory max, so keeping only the top-K
-        # edges per target (by |Interaction|) in a heap is exact and never loads
-        # the full g^2 edge list into memory.
-        if top_k is not None and len(colNames) == 1:
-            self._parse_output_topk(workDir / 'outFile0.txt', top_k)
+        if top_k is not None:
+            merged = self._merge_bounded_trajectory_edges(
+                (
+                    self._iter_output_edges(
+                        workDir / ('outFile' + str(idx) + '.txt')
+                    )
+                    for idx in range(len(colNames))
+                ),
+                top_k,
+            )
+            self._write_ranked_edges(merged)
             return
 
         # General path: original full parse across all trajectories.
         self._parse_output_full(workDir, colNames)
+
+    @staticmethod
+    def _iter_output_edges(out_path):
+        with out_path.open('r', newline='') as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                try:
+                    interaction = abs(float(row['Interaction']))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                # Preserve the original SINCERITIES orientation correction.
+                yield (
+                    row.get('TargetGENES', ''),
+                    row.get('SourceGENES', ''),
+                    interaction,
+                )
 
     def _parse_output_topk(self, out_path, top_k):
         '''

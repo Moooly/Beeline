@@ -20,8 +20,7 @@ class GENIE3Runner(Runner):
         GENIE3_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if not GENIE3_EXPRESSION_FILE.exists():
             # input data
-            ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
+            ExpressionData = self.read_expression_data()
 
             # Write .csv file — arboreto expects cells as rows, genes as columns
             ExpressionData.T.to_csv(GENIE3_EXPRESSION_FILE,
@@ -37,6 +36,7 @@ class GENIE3Runner(Runner):
         # BEELINE runs without a params map behave exactly as before.
         n_estimators = str(self.params.get('nEstimators', 400))
         max_features = str(self.params.get('maxFeatures', 'sqrt'))
+        top_k = str(self.params.get('maxRegulatorsPerTarget', 0))
 
         # Keep the runner and its CLI entrypoint on the same version.  The
         # published arboreto image predates these tuning flags, so relying on
@@ -69,7 +69,9 @@ class GENIE3Runner(Runner):
                             '--inFile=/usr/working_dir/ExpressionData.csv',
                             '--outFile=/usr/working_dir/outFile.txt',
                             f'--nEstimators={n_estimators}',
-                            f'--maxFeatures={max_features}', '\"'])
+                            f'--maxFeatures={max_features}',
+                            f'--topK={top_k}',
+                            f'--nWorkers={getattr(self, "cpu_budget", 1)}', '\"'])
 
         self._run_docker(cmdToRun)
 

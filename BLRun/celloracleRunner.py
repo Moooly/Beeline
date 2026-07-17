@@ -1,9 +1,225 @@
+import atexit
 import csv
 import heapq
+import json
 import os
+from pathlib import Path
+import shlex
+import subprocess
+import threading
+import time
+import uuid
 import pandas as pd
 
 from BLRun.runner import Runner
+
+
+_CELLORACLE_WORKERS = {}
+_CELLORACLE_WORKERS_LOCK = threading.Lock()
+
+
+def _celloracle_script_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[1]
+        / "Algorithms"
+        / "CELLORACLE"
+        / "runCellOracle.py"
+    )
+
+
+def _runtime_mount_root(output_dir: Path) -> Path:
+    """Choose a scope-level mount shared by every confidence run."""
+    resolved = output_dir.resolve()
+    for candidate in (resolved, *resolved.parents):
+        if candidate.name == "outputs":
+            return candidate.parent
+    # Standalone BEELINE layout: <output>/<dataset>/<run>/<algorithm>.
+    return resolved.parents[2]
+
+
+class _CellOracleDockerWorker:
+    def __init__(
+        self,
+        *,
+        image: str,
+        mount_root: Path,
+        cpu_budget: int,
+        memory_budget_mb: int | None,
+    ) -> None:
+        self.image = image
+        self.mount_root = mount_root.resolve()
+        self.cpu_budget = max(1, int(cpu_budget))
+        self.memory_budget_mb = (
+            max(512, int(memory_budget_mb))
+            if memory_budget_mb is not None
+            else None
+        )
+        self.process = None
+        self.log_file = None
+        self.lock = threading.Lock()
+
+    def start(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            return
+
+        self.mount_root.mkdir(parents=True, exist_ok=True)
+        script_path = _celloracle_script_path()
+        command = [
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            f"--cpus={self.cpu_budget}",
+            "-e",
+            f"OMP_NUM_THREADS={self.cpu_budget}",
+            "-e",
+            f"OPENBLAS_NUM_THREADS={self.cpu_budget}",
+            "-e",
+            f"MKL_NUM_THREADS={self.cpu_budget}",
+            "-e",
+            f"NUMEXPR_NUM_THREADS={self.cpu_budget}",
+            "-e",
+            f"VECLIB_MAXIMUM_THREADS={self.cpu_budget}",
+            "-e",
+            f"NUMBA_NUM_THREADS={self.cpu_budget}",
+        ]
+        if self.memory_budget_mb is not None:
+            command.append(f"--memory={self.memory_budget_mb}m")
+        command.extend(
+            [
+                "-v",
+                f"{self.mount_root}:/grnscope/runtime",
+                "-v",
+                f"{script_path}:/runCellOracle.py:ro",
+                self.image,
+                "python",
+                "/runCellOracle.py",
+                "--worker",
+            ]
+        )
+        self.log_file = (self.mount_root / "celloracle-worker.log").open(
+            "a", encoding="utf-8"
+        )
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    def _container_path(self, host_path: Path) -> str:
+        relative_path = host_path.resolve().relative_to(self.mount_root)
+        return str(Path("/grnscope/runtime") / relative_path)
+
+    def submit(self, runner) -> dict:
+        with self.lock:
+            self.start()
+            if self.process is None or self.process.stdin is None:
+                raise RuntimeError("CellOracle persistent container did not start.")
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    "CellOracle persistent container exited with code "
+                    f"{self.process.returncode}."
+                )
+
+            response_path = runner.working_dir / (
+                f"celloracle-response-{uuid.uuid4().hex}.json"
+            )
+            response_path.unlink(missing_ok=True)
+            argv = runner._inference_arguments(
+                in_file=self._container_path(
+                    runner.working_dir / "ExpressionData.csv"
+                ),
+                out_file=self._container_path(runner.working_dir / "outFile.txt"),
+            )
+            request = {
+                "request_id": response_path.stem,
+                "argv": argv,
+                "responseFile": self._container_path(response_path),
+                "logFile": self._container_path(runner.output_dir / "output.txt"),
+                "timeFile": self._container_path(runner.working_dir / "time.txt"),
+            }
+            try:
+                self.process.stdin.write(json.dumps(request) + "\n")
+                self.process.stdin.flush()
+            except BrokenPipeError as exc:
+                raise RuntimeError(
+                    "CellOracle persistent container closed unexpectedly."
+                ) from exc
+
+            while not response_path.is_file():
+                if self.process.poll() is not None:
+                    raise RuntimeError(
+                        "CellOracle persistent container exited before returning "
+                        f"a result (code {self.process.returncode})."
+                    )
+                time.sleep(0.1)
+
+            try:
+                response = json.loads(response_path.read_text(encoding="utf-8"))
+            finally:
+                response_path.unlink(missing_ok=True)
+            if response.get("status") != "Completed":
+                raise RuntimeError(
+                    response.get("error_message")
+                    or "CellOracle persistent inference failed."
+                )
+            return response
+
+    def stop(self, *, force: bool = False) -> None:
+        process = self.process
+        if process is None:
+            return
+        if process.stdin is not None and not process.stdin.closed:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if self.log_file is not None and not self.log_file.closed:
+            self.log_file.close()
+        self.process = None
+
+
+def _get_celloracle_worker(runner):
+    mount_root = _runtime_mount_root(runner.output_dir)
+    key = (
+        runner.image,
+        str(mount_root),
+        int(getattr(runner, "cpu_budget", 1)),
+        getattr(runner, "memory_budget_mb", None),
+    )
+    with _CELLORACLE_WORKERS_LOCK:
+        worker = _CELLORACLE_WORKERS.get(key)
+        if worker is None:
+            worker = _CellOracleDockerWorker(
+                image=runner.image,
+                mount_root=mount_root,
+                cpu_budget=getattr(runner, "cpu_budget", 1),
+                memory_budget_mb=getattr(runner, "memory_budget_mb", None),
+            )
+            _CELLORACLE_WORKERS[key] = worker
+        return worker
+
+
+def shutdown_celloracle_workers() -> None:
+    with _CELLORACLE_WORKERS_LOCK:
+        workers = list(_CELLORACLE_WORKERS.values())
+        _CELLORACLE_WORKERS.clear()
+    for worker in workers:
+        worker.stop()
+
+
+atexit.register(shutdown_celloracle_workers)
 
 
 class CellOracleRunner(Runner):
@@ -22,8 +238,7 @@ class CellOracleRunner(Runner):
         '''
         CELLORACLE_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if not CELLORACLE_EXPRESSION_FILE.exists():
-            ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header=0, index_col=0)
+            ExpressionData = self.read_expression_data()
             ExpressionData.to_csv(CELLORACLE_EXPRESSION_FILE,
                                   sep=',', header=True, index=True)
 
@@ -31,28 +246,65 @@ class CellOracleRunner(Runner):
         '''
         Function to run CellOracle inside the Docker image.
         '''
-        species = str(self.params.get('species', 'human'))
-        base_grn = str(self.params.get('baseGrn', 'auto'))
-        alpha = str(self.params.get('alpha', 10))
-        p_value_cutoff = str(self.params.get('pValueCutoff', 0.05))
-        top_k = str(self.params.get('topK', 0))
-        max_genes = str(self.params.get('maxGenes', 0))
-        max_cells = str(self.params.get('maxCells', 0))
+        # Parameter tests and third-party standalone runners may inject their
+        # own Docker executor. Preserve that compatibility with the one-shot
+        # command while GRNScope uses the persistent container path below.
+        if '_run_docker' in self.__dict__:
+            self._run_legacy_container()
+            return
+
+        response = _get_celloracle_worker(self).submit(self)
+        self.persistent_runtime_observability = {
+            "kind": "celloracle_container_worker",
+            "worker_pid": response.get("worker_pid"),
+            "request_index": response.get("request_index"),
+            "prior_cache_hit": response.get("prior_cache_hit"),
+            "preprocessing_mode": response.get("preprocessing_mode"),
+            "worker_elapsed_seconds": response.get("elapsed_seconds"),
+            "edge_count": response.get("edge_count"),
+        }
+
+    def _inference_arguments(self, *, in_file: str, out_file: str) -> list[str]:
+        requested_top_k = self.params.get('topK', 0)
+        output_top_k = self.params.get('maxRegulatorsPerTarget', 0)
+        positive_limits = []
+        for raw_limit in (requested_top_k, output_top_k):
+            try:
+                parsed_limit = int(raw_limit)
+            except (TypeError, ValueError):
+                continue
+            if parsed_limit > 0:
+                positive_limits.append(parsed_limit)
+        effective_top_k = min(positive_limits) if positive_limits else 0
+        return [
+            '--inFile', in_file,
+            '--outFile', out_file,
+            '--species', str(self.params.get('species', 'human')),
+            '--baseGrn', str(self.params.get('baseGrn', 'auto')),
+            '--alpha', str(self.params.get('alpha', 10)),
+            '--pValueCutoff', str(self.params.get('pValueCutoff', 0.05)),
+            '--topK', str(effective_top_k),
+            '--maxGenes', str(self.params.get('maxGenes', 0)),
+            '--maxCells', str(self.params.get('maxCells', 0)),
+            '--nJobs', str(getattr(self, 'cpu_budget', 1)),
+        ]
+
+    def _run_legacy_container(self):
+        arguments = self._inference_arguments(
+            in_file='/usr/working_dir/ExpressionData.csv',
+            out_file='/usr/working_dir/outFile.txt',
+        )
+        argument_text = ' '.join(shlex.quote(value) for value in arguments)
+        script_path = shlex.quote(str(_celloracle_script_path()))
+        working_dir = shlex.quote(str(self.working_dir))
 
         cmdToRun = ' '.join(['docker run --rm',
-                            f"-v {self.working_dir}:/usr/working_dir",
+                            f"-v {working_dir}:/usr/working_dir",
+                            f"-v {script_path}:/runCellOracle.py:ro",
                             f'{self.image} /bin/sh -c \"time -v -o',
                             "/usr/working_dir/time.txt",
-                            'python runCellOracle.py',
-                            '--inFile', "/usr/working_dir/ExpressionData.csv",
-                            '--outFile', "/usr/working_dir/outFile.txt",
-                            '--species', species,
-                            '--baseGrn', base_grn,
-                            '--alpha', alpha,
-                            '--pValueCutoff', p_value_cutoff,
-                            '--topK', top_k,
-                            '--maxGenes', max_genes,
-                            '--maxCells', max_cells, '\"'])
+                            'python /runCellOracle.py',
+                            argument_text, '\"'])
 
         self._run_docker(cmdToRun)
 

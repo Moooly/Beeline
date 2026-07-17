@@ -4,6 +4,7 @@ args <- commandArgs(trailingOnly = T)
 inFile <- args[1]
 maxLag <- as.numeric(args[2])
 outFile <-  args[3]
+topK <- if (length(args) >= 4) as.integer(args[4]) else 0L
 
 # input expression data
 inputExpr <- read.table(inFile, sep=",", header = 1, row.names = 1)
@@ -22,4 +23,14 @@ Gene1 <- geneNames[MAC_results[,'Row gene index']]
 Gene2 <- geneNames[MAC_results[,'Column gene index']]
 Score <- MAC_results[,'Correlation']
 outDF <- data.frame(Gene1, Gene2, Score)
+if (topK > 0) {
+    outDF$.sequence <- seq_len(nrow(outDF))
+    groups <- split(outDF, outDF$Gene2, drop = TRUE)
+    groups <- lapply(groups, function(group) {
+        ordered <- group[order(-abs(group$Score), group$.sequence), ]
+        ordered[seq_len(min(topK, nrow(ordered))), ]
+    })
+    outDF <- do.call(rbind, groups)
+    outDF <- outDF[order(outDF$.sequence), c("Gene1", "Gene2", "Score")]
+}
 write.table(outDF, outFile, sep = "\t", quote = FALSE, row.names = FALSE)

@@ -1,6 +1,8 @@
 import csv
 import heapq
 import os
+from pathlib import Path
+import shlex
 import pandas as pd
 
 from BLRun.runner import Runner
@@ -19,8 +21,7 @@ class PIDCRunner(Runner):
         # Create ExpressionData.csv file in the created input directory
         PIDC_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if not PIDC_EXPRESSION_FILE.exists():
-            ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
+            ExpressionData = self.read_expression_data()
             ExpressionData.to_csv(PIDC_EXPRESSION_FILE,
                                  sep = '\t', header  = True, index = True)
 
@@ -29,12 +30,19 @@ class PIDCRunner(Runner):
         Function to run PIDC algorithm
         '''
 
+        script_path = (
+            Path(__file__).resolve().parents[1]
+            / 'Algorithms' / 'PIDC' / 'runPIDC.jl'
+        )
+        top_k = str(self._resolve_top_k() or 0)
         cmdToRun = ' '.join(['docker run --rm',
-                            f"-v {self.working_dir}:/usr/working_dir",
+                            f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
+                            f"-v {shlex.quote(str(script_path))}:/runPIDC.jl:ro",
                             f'{self.image} /bin/sh -c \"time -v -o',
                             "/usr/working_dir/time.txt",
-                            'julia runPIDC.jl',
-                            "/usr/working_dir/ExpressionData.csv", "/usr/working_dir/outFile.txt", '\"'])
+                            'julia /runPIDC.jl',
+                            "/usr/working_dir/ExpressionData.csv",
+                            "/usr/working_dir/outFile.txt", top_k, '\"'])
 
         self._run_docker(cmdToRun)
 

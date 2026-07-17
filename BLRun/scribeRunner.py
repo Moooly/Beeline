@@ -15,10 +15,8 @@ class SCRIBERunner(Runner):
         this function will not do anything.
         '''
 
-        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
         for idx in range(len(colNames)):
@@ -60,9 +58,9 @@ class SCRIBERunner(Runner):
         fam = str(self.params['expressionFamily'])
 
         # Build the command to run Scribe
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
         colNames = PTData.columns
+        commands = []
 
         for idx in range(len(colNames)):
             # Specify file names for inputs and outputs
@@ -86,7 +84,9 @@ class SCRIBERunner(Runner):
 
             cmdToRun += '\"'
 
-            self._run_docker(cmdToRun, append=(idx > 0))
+            commands.append(cmdToRun)
+
+        self._run_docker_batch(commands)
 
     def _resolve_top_k(self):
         '''
@@ -110,8 +110,7 @@ class SCRIBERunner(Runner):
         '''
         workDir = self.working_dir
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
         colNames = PTData.columns
 
         # Quit if any trajectory output is missing (matches original behaviour).

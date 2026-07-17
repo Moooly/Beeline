@@ -1,6 +1,8 @@
 import csv
 import heapq
 import os
+from pathlib import Path
+import shlex
 import pandas as pd
 
 from BLRun.runner import Runner
@@ -18,10 +20,8 @@ class GRNVBEMRunner(Runner):
         the rows. If the files already exist, this function will overwrite it.
         '''
 
-        ExpressionData = pd.read_csv(self.input_dir / self.exprData,
-                                         header = 0, index_col = 0)
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        ExpressionData = self.read_expression_data()
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
         for idx in range(len(colNames)):
@@ -47,20 +47,42 @@ class GRNVBEMRunner(Runner):
         Function to run GRN-VBEM algorithm
         '''
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
+        top_k = self._resolve_top_k() or 0
+        compactor_path = (
+            Path(__file__).resolve().parents[1]
+            / 'Algorithms' / 'compactEdgeList.awk'
+        )
 
         colNames = PTData.columns
+        commands = []
         for idx in range(len(colNames)):
+            output_path = "/usr/working_dir/outFile" + str(idx) + ".txt"
+            algorithm_output_path = (
+                "/tmp/grnvbem-full.txt" if top_k else output_path
+            )
+            compact_command = (
+                " && awk"
+                f" -v top_k={top_k} -v input_header=1"
+                " -v source_col=1 -v target_col=3 -v score_col=5"
+                " -v output_source=Parent -v output_target=Child"
+                " -v output_score=Probability -F '\\t'"
+                f" -f /compactEdgeList.awk {algorithm_output_path} > {output_path}"
+                if top_k
+                else ""
+            )
             cmdToRun = ' '.join(['docker run --rm',
-                                f"-v {self.working_dir}:/usr/working_dir",
+                                f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
+                                f"-v {shlex.quote(str(compactor_path))}:/compactEdgeList.awk:ro",
                                 f'{self.image} /bin/sh -c \"time -v -o',
                                 "/usr/working_dir/time" + str(idx) + ".txt",
                                 './GRNVBEM',
                                 "/usr/working_dir/ExpressionData" + str(idx) + ".csv",
-                                "/usr/working_dir/outFile" + str(idx) + ".txt", '\"'])
+                                algorithm_output_path + compact_command, '\"'])
 
-            self._run_docker(cmdToRun, append=(idx > 0))
+            commands.append(cmdToRun)
+
+        self._run_docker_batch(commands)
 
     def _resolve_top_k(self):
         '''
@@ -84,8 +106,7 @@ class GRNVBEMRunner(Runner):
         '''
         workDir = self.working_dir
 
-        PTData = pd.read_csv(self.input_dir / self.pseudoTimeData,
-                             header = 0, index_col = 0)
+        PTData = self.read_pseudotime_data()
 
         colNames = PTData.columns
 
@@ -97,16 +118,36 @@ class GRNVBEMRunner(Runner):
 
         top_k = self._resolve_top_k()
 
-        # Bounded fast path: a single trajectory with a per-target cap. GRNVBEM
-        # scores every parent->child pair (g^2 edges); with one trajectory there
-        # is no cross-trajectory max, so keeping only the top-K parents per target
-        # (Child) in a heap is exact and never loads the full g^2 list into memory.
-        if top_k is not None and len(colNames) == 1:
-            self._parse_output_topk(workDir / 'outFile0.txt', top_k)
+        if top_k is not None:
+            merged = self._merge_bounded_trajectory_edges(
+                (
+                    self._iter_output_edges(
+                        workDir / ('outFile' + str(idx) + '.txt')
+                    )
+                    for idx in range(len(colNames))
+                ),
+                top_k,
+            )
+            self._write_ranked_edges(merged)
             return
 
         # General path: original full parse across all trajectories.
         self._parse_output_full(workDir, colNames)
+
+    @staticmethod
+    def _iter_output_edges(out_path):
+        with out_path.open('r', newline='') as handle:
+            reader = csv.DictReader(handle, delimiter='\t')
+            for row in reader:
+                try:
+                    probability = float(row['Probability'])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                yield (
+                    row.get('Parent', ''),
+                    row.get('Child', ''),
+                    probability,
+                )
 
     def _parse_output_topk(self, out_path, top_k):
         '''
