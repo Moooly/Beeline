@@ -11,7 +11,7 @@ RUN echo "deb [trusted=yes] http://archive.debian.org/debian stretch main non-fr
 RUN cat /etc/apt/sources.list
 
 RUN apt-get update && \
-    apt-get -y install libxt6 bzip2 && \
+    apt-get -y install libxt6 bzip2 time octave && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Miniconda3 following https://hub.docker.com/r/continuumio/miniconda3/dockerfile

@@ -18,6 +18,17 @@ from BLRun.singeRunner import SINGERunner
 
 
 class AlgorithmRunnerParameterTests(unittest.TestCase):
+    def test_singe_local_image_contains_runtime_commands_used_by_runner(self):
+        dockerfile = (
+            Path(__file__).resolve().parents[1]
+            / "Algorithms"
+            / "SINGE"
+            / "Dockerfile"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("time", dockerfile)
+        self.assertIn("octave", dockerfile)
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(prefix="beeline-parameter-test-")
         self.root = Path(self.temp_dir.name)

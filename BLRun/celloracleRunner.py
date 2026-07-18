@@ -128,7 +128,10 @@ class _CellOracleDockerWorker:
             response_path = runner.working_dir / (
                 f"celloracle-response-{uuid.uuid4().hex}.json"
             )
-            response_path.unlink(missing_ok=True)
+            try:
+                response_path.unlink()
+            except FileNotFoundError:
+                pass
             argv = runner._inference_arguments(
                 in_file=self._container_path(
                     runner.working_dir / "ExpressionData.csv"
@@ -161,7 +164,10 @@ class _CellOracleDockerWorker:
             try:
                 response = json.loads(response_path.read_text(encoding="utf-8"))
             finally:
-                response_path.unlink(missing_ok=True)
+                try:
+                    response_path.unlink()
+                except FileNotFoundError:
+                    pass
             if response.get("status") != "Completed":
                 raise RuntimeError(
                     response.get("error_message")

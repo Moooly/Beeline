@@ -417,7 +417,7 @@ class Runner(ABC):
             for log_path in log_paths:
                 if log_path.is_file():
                     combined_output.write(log_path.read_text(errors='replace'))
-                    log_path.unlink(missing_ok=True)
+                    log_path.unlink()
 
     def _write_ranked_edges(self, df: pd.DataFrame) -> None:
         """

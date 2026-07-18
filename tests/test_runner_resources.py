@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+import inspect
 from pathlib import Path
 
 import pandas as pd
@@ -25,6 +26,16 @@ class RunnerResourceTests(unittest.TestCase):
         self.assertEqual(
             Runner._apply_docker_resource_limits.__annotations__["cpu_budget"],
             "int | None",
+        )
+
+    def test_shared_runners_do_not_use_python_38_missing_ok(self):
+        self.assertNotIn(
+            "missing_ok",
+            inspect.getsource(Runner),
+        )
+        self.assertNotIn(
+            "missing_ok",
+            inspect.getsource(_CellOracleDockerWorker),
         )
         self.assertEqual(
             _CellOracleDockerWorker.__init__.__annotations__["memory_budget_mb"],
