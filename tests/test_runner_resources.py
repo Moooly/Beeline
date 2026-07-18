@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from BLRun.celloracleRunner import _CellOracleDockerWorker
 from BLRun.runner import Runner
 
 
@@ -20,6 +21,16 @@ class MinimalRunner(Runner):
 
 
 class RunnerResourceTests(unittest.TestCase):
+    def test_python_39_compatible_annotations_are_postponed(self):
+        self.assertEqual(
+            Runner._apply_docker_resource_limits.__annotations__["cpu_budget"],
+            "int | None",
+        )
+        self.assertEqual(
+            _CellOracleDockerWorker.__init__.__annotations__["memory_budget_mb"],
+            "int | None",
+        )
+
     def make_runner(self, root):
         runner = MinimalRunner.__new__(MinimalRunner)
         runner.output_dir = root
