@@ -8,6 +8,8 @@ from BLRun.runner import Runner
 class SCRIBERunner(Runner):
     """Concrete runner for the SCRIBE GRN inference algorithm."""
 
+    _MEMORY_PER_PAIR_WORKER_MB = 768
+
     def generateInputs(self):
         '''
         Function to generate desired inputs for SCRIBE.
@@ -60,6 +62,7 @@ class SCRIBERunner(Runner):
         # Build the command to run Scribe
         PTData = self.read_pseudotime_data()
         colNames = PTData.columns
+        pair_workers = self._resolve_pair_workers(len(colNames))
         commands = []
 
         for idx in range(len(colNames)):
@@ -75,7 +78,8 @@ class SCRIBERunner(Runner):
                            "/usr/working_dir/" + timeFile, 'Rscript runScribe.R',
                            '-e', "/usr/working_dir/" + exprName, '-c', "/usr/working_dir/" + cellName,
                            '-g', "/usr/working_dir/GeneData.csv", '-o /usr/working_dir/', '-d', delay, '-l', low,
-                           '-m', method, '-x', fam, '--outFile ' + outFile])
+                           '-m', method, '-x', fam, '-w', str(pair_workers),
+                           '--outFile ' + outFile])
 
             if str(self.params['log']) == 'True':
                 cmdToRun += ' --log'
@@ -87,6 +91,42 @@ class SCRIBERunner(Runner):
             commands.append(cmdToRun)
 
         self._run_docker_batch(commands)
+
+    def _resolve_pair_workers(self, trajectory_count):
+        """Divide the allocated CPU and memory safely across trajectories.
+
+        SCRIBE's upstream OpenMP path is disabled and marked non-thread-safe.
+        The R entrypoint therefore uses independent forked processes over
+        disjoint gene-pair chunks. This helper mirrors ``_run_docker_batch``'s
+        trajectory allocation so nested work never oversubscribes the job's
+        resource budget.
+        """
+        trajectory_count = max(1, int(trajectory_count))
+        total_cpu_budget = max(1, int(getattr(self, 'cpu_budget', 1)))
+        trajectory_workers = max(
+            1,
+            int(getattr(self, 'trajectory_workers', total_cpu_budget)),
+        )
+        parallel_trajectories = min(
+            trajectory_count,
+            trajectory_workers,
+            total_cpu_budget,
+        )
+        cpu_per_trajectory = max(1, total_cpu_budget // parallel_trajectories)
+
+        total_memory_budget = getattr(self, 'memory_budget_mb', None)
+        if total_memory_budget is None:
+            return cpu_per_trajectory
+
+        memory_per_trajectory = max(
+            512,
+            int(total_memory_budget) // parallel_trajectories,
+        )
+        memory_workers = max(
+            1,
+            memory_per_trajectory // self._MEMORY_PER_PAIR_WORKER_MB,
+        )
+        return min(cpu_per_trajectory, memory_workers)
 
     def _resolve_top_k(self):
         '''

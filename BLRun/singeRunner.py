@@ -9,6 +9,11 @@ from BLRun.runner import Runner
 class SINGERunner(Runner):
     """Concrete runner for the SINGE GRN inference algorithm."""
 
+    # A 1,999-gene / 818-cell GLG process used about 3.1 GiB in production.
+    # Reserve additional headroom for MATLAB runtime variance and Docker.
+    _REPLICATE_MEMORY_MB = 3584
+    _MEMORY_SAFETY_FRACTION = 0.85
+
     def generateInputs(self):
         '''
         Function to generate desired inputs for SINGE.
@@ -31,22 +36,13 @@ class SINGERunner(Runner):
                                  sep = ',', header  = True, index = False)
 
     def run(self):
-        '''
-        Function to run SINGE algorithm
-        '''
+        '''Function to run SINGE algorithm.'''
 
-        # if the parameters aren't specified, then use default parameters
-        # TODO allow passing in multiple sets of hyperparameters
-        # these must be in the right order!
         params_order = [
             'lambda', 'dT', 'num_lags', 'kernel_width',
             'prob_zero_removal', 'prob_remove_samples',
-            'family'
+            'family',
         ]
-        # Standalone-BEELINE fallbacks, used only when a param is omitted from
-        # the config. Kept in sync with the GRNScope algorithm registry
-        # (backend/app/algorithm_registry.py, SINGE) so both entry points share
-        # one set of defaults. GRNScope always supplies these explicitly.
         default_params = {
             'lambda': '0.01',
             'dT': '15',
@@ -63,63 +59,134 @@ class SINGERunner(Runner):
                 params[param] = val
 
         num_replicates = int(params['num_replicates'])
-        replicates = []
-        for replicate in range(num_replicates):
-           replicates.append(' '.join('--' + p.replace('_', '-') + ' ' + str(params[p]) for p in params_order) + ' '.join(['', '--replicate', str(replicate), '--ID', str(replicate)]))
-        params_str = '\n'.join(replicates)
-        # Write parameter data directly instead of interpolating it into the
-        # container shell command. This keeps configuration values out of shell
-        # syntax even when the runner is used outside GRNScope's API validation.
+        replicates = [
+            ' '.join(
+                '--' + parameter.replace('_', '-') + ' ' + str(params[parameter])
+                for parameter in params_order
+            )
+            + ' '.join(['', '--replicate', str(replicate), '--ID', str(replicate)])
+            for replicate in range(num_replicates)
+        ]
         (self.working_dir / 'hyperparameters.txt').write_text(
-            params_str + '\n',
+            '\n'.join(replicates) + '\n',
             encoding='utf-8',
         )
 
         PTData = self.read_pseudotime_data()
+        trajectory_inputs = []
+        prepare_commands = []
+        for idx in range(len(PTData.columns)):
+            os.makedirs(str(self.working_dir / str(idx)), exist_ok=True)
+            out_file_symlink = 'out' + str(idx)
+            input_file = '/usr/working_dir/ExpressionData' + str(idx) + '.csv'
+            input_mat = '/usr/working_dir/ExpressionData' + str(idx) + '.mat'
+            gene_list_mat = '/usr/working_dir/GeneList' + str(idx) + '.mat'
+            params_file = '/usr/working_dir/hyperparameters.txt'
 
-        colNames = PTData.columns
-        commands = []
-        for idx in range(len(colNames)):
-            os.makedirs(str(self.working_dir / str(idx)), exist_ok = True)
+            convert_input_to_matfile = 'octave -q --eval \\"CSV = csvread(\'' + input_file + '\'); ' + \
+                'X = sparse(CSV(2:end,1:end-1).\'); ptime = CSV(2:end,end).\'; ' + \
+                'Kp2.Kp = single(ptime); Kp2.sumKp = single(ptime*X.\'); fullKp(1, ' + \
+                str(int(params['dT']) * int(params['num_lags'])) + ') = Kp2; ' + \
+                'save(\'-v7\',\'' + input_mat + '\', \'X\', \'ptime\', \'fullKp\'); ' + \
+                'f = fopen(\'' + input_file + '\'); gene_list = strsplit(fgetl(f), \',\')(1:end-1).\'; fclose(f); ' + \
+                'save(\'-v7\',\'' + gene_list_mat + '\', \'gene_list\')\\"'
 
-            outFileSymlink = "out" + str(idx)
-            inputFile = "/usr/working_dir/ExpressionData"+str(idx)+".csv"
-            inputMat = "/usr/working_dir/ExpressionData"+str(idx)+".mat"
-            geneListMat = "/usr/working_dir/GeneList"+str(idx)+".mat"
-            paramsFile = "/usr/working_dir/hyperparameters.txt"
+            prepare_commands.append(' '.join([
+                'docker run --rm --entrypoint /bin/sh',
+                f'-v {self.working_dir}:/usr/working_dir',
+                f'{self.image} -c "',
+                convert_input_to_matfile,
+                '"',
+            ]))
+            trajectory_inputs.append(
+                (idx, input_mat, gene_list_mat, out_file_symlink, params_file)
+            )
 
-            '''
-            This is a workaround for https://github.com/gitter-lab/SINGE/blob/master/code/parseParams.m#L39
-            not allowing '/' characters in the outDir parameter.
-            '''
-            symlink_out_file = ' '.join(['ln -s', "/usr/working_dir/" + str(idx) + "/", outFileSymlink])
+        worker_limit = self._resolve_parallel_worker_limit(
+            max(1, len(trajectory_inputs) * num_replicates)
+        )
+        self._run_docker_batch(
+            prepare_commands,
+            max_workers=worker_limit,
+            log_prefix='singe-prepare',
+        )
 
-            '''
-            See https://github.com/gitter-lab/SINGE/blob/master/README.md.  SINGE expects a data matfile with variables "X" and "ptime",
-            and a gene_list matfile with the variable "gene_list".
+        replicate_commands = []
+        for idx, input_mat, gene_list_mat, out_file_symlink, params_file in trajectory_inputs:
+            symlink_output = ' '.join([
+                'ln -s',
+                '/usr/working_dir/' + str(idx) + '/',
+                out_file_symlink,
+            ])
+            for replicate in range(num_replicates):
+                replicate_commands.append(' '.join([
+                    'docker run --rm --entrypoint /bin/sh',
+                    f'-v {self.working_dir}:/usr/working_dir',
+                    f'{self.image} -c "',
+                    symlink_output,
+                    '&& time -v -o',
+                    f'/usr/working_dir/time{idx}-replicate-{replicate}.txt',
+                    '/usr/local/SINGE/SINGE.sh /usr/local/MATLAB/MATLAB_Runtime/v94 GLG',
+                    input_mat,
+                    gene_list_mat,
+                    out_file_symlink,
+                    params_file,
+                    str(replicate + 1),
+                    '"',
+                ]))
 
-            Saving fullKp is a very hacky workaround for https://github.com/gitter-lab/SINGE/blob/master/code/iLasso_for_SINGE.m#L56,
-            that assumes this input was saved in matfile v7.3 which octave does not support.
-            '''
-            convert_input_to_matfile = 'octave -q --eval \\"CSV = csvread(\'' + inputFile + '\'); ' + \
-                                 'X = sparse(CSV(2:end,1:end-1).\'); ptime = CSV(2:end,end).\'; ' + \
-                                 'Kp2.Kp = single(ptime); Kp2.sumKp = single(ptime*X.\'); fullKp(1, ' + \
-                                 str(int(params['dT'])*int(params['num_lags'])) + ') = Kp2; ' + \
-                                 'save(\'-v7\',\'' + inputMat + '\', \'X\', \'ptime\', \'fullKp\'); ' + \
-                                 'f = fopen(\'' + inputFile + '\'); gene_list = strsplit(fgetl(f), \',\')(1:end-1).\'; fclose(f); ' + \
-                                 'save(\'-v7\',\'' + geneListMat + '\', \'gene_list\')\\"'
+        self._run_docker_batch(
+            replicate_commands,
+            append=True,
+            max_workers=worker_limit,
+            log_prefix='singe-replicate',
+        )
 
-            cmdToRun = ' '.join(['docker run --rm --entrypoint /bin/sh',
-                                f"-v {self.working_dir}:/usr/working_dir",
-                                f'{self.image} -c \"',
-                                 symlink_out_file, '&&', convert_input_to_matfile,
-                                 '&& time -v -o', "/usr/working_dir/time" + str(idx) + ".txt",
-                                 '/usr/local/SINGE/SINGE.sh /usr/local/MATLAB/MATLAB_Runtime/v94 standalone',
-                                 inputMat, geneListMat, outFileSymlink, paramsFile, '\"'])
+        aggregate_commands = []
+        for idx, input_mat, gene_list_mat, out_file_symlink, _params_file in trajectory_inputs:
+            symlink_output = ' '.join([
+                'ln -s',
+                '/usr/working_dir/' + str(idx) + '/',
+                out_file_symlink,
+            ])
+            aggregate_commands.append(' '.join([
+                'docker run --rm --entrypoint /bin/sh',
+                f'-v {self.working_dir}:/usr/working_dir',
+                f'{self.image} -c "',
+                symlink_output,
+                '&& time -v -o',
+                f'/usr/working_dir/time{idx}-aggregate.txt',
+                '/usr/local/SINGE/SINGE.sh /usr/local/MATLAB/MATLAB_Runtime/v94 Aggregate',
+                input_mat,
+                gene_list_mat,
+                out_file_symlink,
+                '"',
+            ]))
 
-            commands.append(cmdToRun)
+        self._run_docker_batch(
+            aggregate_commands,
+            append=True,
+            max_workers=worker_limit,
+            log_prefix='singe-aggregate',
+        )
 
-        self._run_docker_batch(commands)
+    def _resolve_parallel_worker_limit(self, command_count):
+        cpu_budget = max(1, int(getattr(self, 'cpu_budget', 1)))
+        trajectory_workers = max(
+            1,
+            int(getattr(self, 'trajectory_workers', cpu_budget)),
+        )
+        worker_limit = min(max(1, int(command_count)), cpu_budget, trajectory_workers)
+        memory_budget_mb = getattr(self, 'memory_budget_mb', None)
+        if memory_budget_mb is not None:
+            safe_memory_mb = int(
+                max(512, int(memory_budget_mb)) * self._MEMORY_SAFETY_FRACTION
+            )
+            worker_limit = min(
+                worker_limit,
+                max(1, safe_memory_mb // self._REPLICATE_MEMORY_MB),
+            )
+        return max(1, worker_limit)
 
     def parseOutput(self):
         '''

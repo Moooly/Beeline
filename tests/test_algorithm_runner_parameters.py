@@ -99,6 +99,7 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         runner, commands = self.make_runner(
             SCRIBERunner,
             {
+                "maxGenes": 3,
                 "delay": 2,
                 "method": "RDI",
                 "lowerDetectionLimit": 0.1,
@@ -114,13 +115,27 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         self.assertIn("-l 0.1", command)
         self.assertIn("-m RDI", command)
         self.assertIn("-x negbinomial", command)
+        self.assertIn("-w 1", command)
         self.assertIn("--log", command)
         self.assertNotIn(" -i", command)
+
+    def test_scribe_pair_workers_respect_trajectory_cpu_and_memory_budgets(self):
+        runner, _commands = self.make_runner(SCRIBERunner, {})
+        runner.cpu_budget = 4
+        runner.trajectory_workers = 4
+        runner.memory_budget_mb = 14345
+
+        self.assertEqual(runner._resolve_pair_workers(1), 4)
+        self.assertEqual(runner._resolve_pair_workers(2), 2)
+
+        runner.memory_budget_mb = 700
+        self.assertEqual(runner._resolve_pair_workers(1), 1)
 
     def test_singe_writes_all_exposed_parameters_and_replicate_count(self):
         runner, commands = self.make_runner(
             SINGERunner,
             {
+                "maxGenes": 3,
                 "lambda": 0.2,
                 "dT": 4,
                 "num_lags": 3,
@@ -143,8 +158,25 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
             self.assertIn("--prob-zero-removal 0.2", line)
             self.assertIn("--prob-remove-samples 0.3", line)
             self.assertIn("--family poisson", line)
-        self.assertEqual(len(commands), 1)
+        self.assertEqual(len(commands), 4)
         self.assertIn("fullKp(1, 12)", commands[0][0])
+        self.assertIn(" GLG ", commands[1][0])
+        self.assertIn("hyperparameters.txt 1", commands[1][0])
+        self.assertIn(" GLG ", commands[2][0])
+        self.assertIn("hyperparameters.txt 2", commands[2][0])
+        self.assertIn(" Aggregate ", commands[3][0])
+
+    def test_singe_parallel_workers_respect_cpu_and_memory(self):
+        runner, _commands = self.make_runner(SINGERunner, {})
+        runner.cpu_budget = 4
+        runner.trajectory_workers = 4
+        runner.memory_budget_mb = 14345
+
+        self.assertEqual(runner._resolve_parallel_worker_limit(3), 3)
+        self.assertEqual(runner._resolve_parallel_worker_limit(8), 3)
+
+        runner.memory_budget_mb = 7000
+        self.assertEqual(runner._resolve_parallel_worker_limit(3), 1)
 
     def test_leap_and_grisli_forward_their_parameters(self):
         leap, leap_commands = self.make_runner(LEAPRunner, {"maxLag": 0.2})
@@ -194,6 +226,36 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         self.assertIn("Rscript /runPPCOR.R", ppcor_commands[0][0])
         self.assertIn(" 0.05 4", ppcor_commands[0][0])
 
+    def test_pidc_applies_its_gene_filter_and_uses_an_explicit_tab_delimiter(self):
+        runner, _commands = self.make_runner(
+            PIDCRunner,
+            {"maxGenes": 3},
+        )
+        pd.DataFrame(
+            {
+                "cell-1": [0, 0, 0, 1, 0],
+                "cell-2": [0, 1, 2, 1, 3],
+                "cell-3": [0, 2, 4, 1, 6],
+            },
+            index=["gene-a", "gene-b", "gene-c", "gene-d", "gene-e"],
+        ).to_csv(self.input_dir / "ExpressionData.csv")
+
+        runner.generateInputs()
+
+        generated = pd.read_csv(
+            self.working_dir / "ExpressionData.csv",
+            sep="\t",
+            index_col=0,
+        )
+        self.assertEqual(list(generated.index), ["gene-e", "gene-c", "gene-b"])
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "Algorithms"
+            / "PIDC"
+            / "runPIDC.jl"
+        ).read_text(encoding="utf-8")
+        self.assertIn("get_nodes(dataset_name; delim='\\t')", script)
+
     def test_scsgl_forwards_density_and_association_parameters(self):
         runner, commands = self.make_runner(
             SCSGLRunner,
@@ -206,11 +268,45 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         self.assertIn("--assoc=dotprod", command)
 
     def test_sincerities_uses_the_selected_bin_count(self):
-        runner, _commands = self.make_runner(SINCERITIESRunner, {"nBins": 2})
+        runner, _commands = self.make_runner(
+            SINCERITIESRunner,
+            {"maxGenes": 2, "nBins": 2},
+        )
         runner.generateInputs()
 
         generated = pd.read_csv(self.working_dir / "ExpressionData0.csv")
         self.assertEqual(generated["Time"].nunique(), 2)
+        self.assertEqual(
+            [column for column in generated.columns if column != "Time"],
+            ["gene-a", "gene-b"],
+        )
+
+    def test_sincerities_stays_below_the_smallest_trajectory_cell_count(self):
+        runner, _commands = self.make_runner(
+            SINCERITIESRunner,
+            {"maxGenes": 5, "nBins": 2},
+        )
+        pd.DataFrame(
+            {
+                cell: [index, index * 2, index * 3, 1, index * 4, index * 5]
+                for index, cell in enumerate(self.expression.columns)
+            },
+            index=["gene-a", "gene-b", "gene-c", "gene-d", "gene-e", "gene-f"],
+        ).to_csv(self.input_dir / "ExpressionData.csv")
+        pd.DataFrame(
+            {
+                "trajectory-a": range(8),
+                "trajectory-b": [0, 1, 2, 3, None, None, None, None],
+            },
+            index=self.expression.columns,
+        ).to_csv(self.input_dir / "PseudoTime.csv")
+
+        runner.generateInputs()
+
+        generated_a = pd.read_csv(self.working_dir / "ExpressionData0.csv")
+        generated_b = pd.read_csv(self.working_dir / "ExpressionData1.csv")
+        self.assertEqual(len(generated_a.columns) - 1, 3)
+        self.assertEqual(len(generated_b.columns) - 1, 3)
 
     def test_ppcor_uses_the_selected_p_value_cutoff(self):
         runner, _commands = self.make_runner(PPCORRunner, {"pVal": 0.05})

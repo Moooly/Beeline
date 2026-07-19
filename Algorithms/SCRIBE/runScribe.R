@@ -46,6 +46,10 @@ option_list <- list (
               make_option(c("-d","--delay"), default = '1', type = 'character',
               help= "Comma separated list of delay values for Scribe. Maximum delay
               value should be the total number of cells in the dataset. default = %default ."),
+
+              make_option(c("-w","--workers"), default = 1, type = 'integer',
+              help= "Independent worker processes used to evaluate directed gene-pair
+              chunks. Results are merged before post-processing. default = %default ."),
               
               make_option(c("--log"), action = 'store_true', default = FALSE, type = 'character',
               help= "Log transform expression values. default = %default ."),
@@ -154,24 +158,206 @@ cat("Computing",arguments$method,"\n")
 
 delay <- as.numeric(strsplit(arguments$delay, ",")[[1]])
 
+build_pair_graph <- function(n_genes) {
+  gene_ids <- seq.int(0L, n_genes - 1L)
+  pair_graph <- as.matrix(expand.grid(gene_ids, gene_ids))
+  pair_graph <- pair_graph[pair_graph[, 1] != pair_graph[, 2], , drop = FALSE]
+  storage.mode(pair_graph) <- "integer"
+  pair_graph
+}
+
+split_pair_graph <- function(pair_graph, workers) {
+  worker_count <- max(1L, min(as.integer(workers), nrow(pair_graph)))
+  split(
+    seq_len(nrow(pair_graph)),
+    rep(seq_len(worker_count), length.out = nrow(pair_graph))
+  )
+}
+
+merge_rdi_chunks <- function(chunk_results, pair_graph, pair_chunks, delays) {
+  merged <- chunk_results[[1]]
+  merged$RDI[,] <- 0
+  merged$max_rdi_value[,] <- 0
+  merged$max_rdi_delays[,] <- 0
+  n_genes <- nrow(merged$max_rdi_value)
+
+  for (chunk_index in seq_along(pair_chunks)) {
+    pair_rows <- pair_chunks[[chunk_index]]
+    current_pairs <- pair_graph[pair_rows, , drop = FALSE]
+    source_ids <- current_pairs[, 1] + 1L
+    target_ids <- current_pairs[, 2] + 1L
+    matrix_indices <- cbind(source_ids, target_ids)
+    current_result <- chunk_results[[chunk_index]]
+
+    merged$max_rdi_value[matrix_indices] <-
+      current_result$max_rdi_value[matrix_indices]
+    merged$max_rdi_delays[matrix_indices] <-
+      current_result$max_rdi_delays[matrix_indices]
+
+    for (delay_index in seq_along(delays)) {
+      rdi_indices <- cbind(
+        source_ids,
+        target_ids + (delay_index - 1L) * n_genes
+      )
+      merged$RDI[rdi_indices] <- current_result$RDI[rdi_indices]
+    }
+  }
+  merged
+}
+
+calculate_rdi_by_pairs <- function(CDS, delays, uniformalize, log_values,
+                                   workers, pair_graph) {
+  if (workers <= 1L) {
+    return(calculate_rdi(
+      CDS,
+      delays = delays,
+      method = 2,
+      uniformalize = uniformalize,
+      log = log_values
+    ))
+  }
+
+  pair_chunks <- split_pair_graph(pair_graph, workers)
+  chunk_results <- parallel::mclapply(
+    pair_chunks,
+    function(pair_rows) {
+      calculate_rdi(
+        CDS,
+        delays = delays,
+        super_graph = pair_graph[pair_rows, , drop = FALSE],
+        method = 2,
+        uniformalize = uniformalize,
+        log = log_values
+      )
+    },
+    mc.cores = length(pair_chunks),
+    mc.preschedule = TRUE,
+    mc.set.seed = FALSE
+  )
+  failed_chunks <- vapply(chunk_results, inherits, logical(1), "try-error")
+  if (any(failed_chunks)) {
+    stop(
+      "SCRIBE RDI worker failed: ",
+      paste(as.character(chunk_results[failed_chunks]), collapse = "; ")
+    )
+  }
+  merge_rdi_chunks(
+    chunk_results,
+    pair_graph,
+    pair_chunks,
+    delays
+  )
+}
+
+calculate_conditioned_chunk <- function(CDS, pair_graph, rdi_list,
+                                        uniformalize, log_values) {
+  size_factors <- sizeFactors(CDS)
+  size_factors[is.na(size_factors)] <- 1
+  ordered_cells <- order(pData(CDS)$Pseudotime)
+  genes_data <- t(as.matrix(exprs(CDS)[, ordered_cells])) /
+    size_factors[ordered_cells]
+  if (log_values) {
+    genes_data <- log(genes_data + 1)
+  }
+  if (!all(is.finite(genes_data))) {
+    stop("your data includes non finite values!")
+  }
+
+  conditioned <- calculate_conditioned_rdi_cpp_wrap(
+    genes_data,
+    pair_graph,
+    rdi_list$max_rdi_value,
+    rdi_list$max_rdi_delays,
+    1L,
+    uniformalize
+  )
+  dimnames(conditioned) <- list(colnames(genes_data), colnames(genes_data))
+  conditioned
+}
+
+calculate_conditioned_rdi_by_pairs <- function(CDS, rdi_list, uniformalize,
+                                               log_values, workers,
+                                               pair_graph) {
+  if (workers <= 1L) {
+    return(calculate_conditioned_rdi(
+      CDS,
+      rdi_list = rdi_list,
+      uniformalize = uniformalize,
+      log = log_values
+    ))
+  }
+
+  pair_chunks <- split_pair_graph(pair_graph, workers)
+  chunk_results <- parallel::mclapply(
+    pair_chunks,
+    function(pair_rows) {
+      calculate_conditioned_chunk(
+        CDS,
+        pair_graph[pair_rows, , drop = FALSE],
+        rdi_list,
+        uniformalize,
+        log_values
+      )
+    },
+    mc.cores = length(pair_chunks),
+    mc.preschedule = TRUE,
+    mc.set.seed = FALSE
+  )
+  failed_chunks <- vapply(chunk_results, inherits, logical(1), "try-error")
+  if (any(failed_chunks)) {
+    stop(
+      "SCRIBE conditioned-RDI worker failed: ",
+      paste(as.character(chunk_results[failed_chunks]), collapse = "; ")
+    )
+  }
+
+  merged <- chunk_results[[1]]
+  merged[,] <- 0
+  for (chunk_index in seq_along(pair_chunks)) {
+    current_pairs <- pair_graph[pair_chunks[[chunk_index]], , drop = FALSE]
+    matrix_indices <- cbind(
+      current_pairs[, 1] + 1L,
+      current_pairs[, 2] + 1L
+    )
+    merged[matrix_indices] <- chunk_results[[chunk_index]][matrix_indices]
+  }
+  merged
+}
+
+n_genes <- nrow(exprs(CDS))
+pair_count <- n_genes * (n_genes - 1L)
+requested_workers <- max(1L, as.integer(arguments$workers))
+pair_workers <- max(1L, min(requested_workers, pair_count))
+pair_graph <- if (pair_workers > 1L) build_pair_graph(n_genes) else NULL
+cat("Using", pair_workers, "worker process(es) for", pair_count,
+    "directed gene pairs.\n")
+
 if (arguments$method == 'uRDI'){
-  net <- calculate_rdi(CDS, delays = delay, method = 2, uniformalize = TRUE, log = arguments$log)
+  net <- calculate_rdi_by_pairs(CDS, delay, TRUE, arguments$log,
+                                pair_workers, pair_graph)
   netOut <- net$max_rdi_value
   # computes CLR if we use uRDI
   # TODO: Make this an optional
   netOut <- clr(netOut)
 } else if (arguments$method == 'ucRDI'){
-  net <- calculate_rdi(CDS, delays = delay, method = 2, uniformalize = TRUE, log = arguments$log)
-  netOut <- calculate_conditioned_rdi(CDS, rdi_list = net, uniformalize = TRUE, log = arguments$log)
+  net <- calculate_rdi_by_pairs(CDS, delay, TRUE, arguments$log,
+                                pair_workers, pair_graph)
+  netOut <- calculate_conditioned_rdi_by_pairs(
+    CDS, net, TRUE, arguments$log, pair_workers, pair_graph
+  )
 } else if (arguments$method == 'RDI'){
-  net <- calculate_rdi(CDS, delays = delay, method = 2, uniformalize = FALSE, log = arguments$log)
+  net <- calculate_rdi_by_pairs(CDS, delay, FALSE, arguments$log,
+                                pair_workers, pair_graph)
   netOut <- net$max_rdi_value
   # computes CLR if we use RDI
   # TODO: Make this optional
   netOut <- clr(netOut)
 } else if (arguments$method == 'cRDI'){
-  net <- calculate_rdi(CDS, delays = delay, method = 2, uniformalize = FALSE, log = arguments$log)
-  netOut <- calculate_conditioned_rdi(CDS, rdi_list = net, uniformalize = FALSE, log = arguments$log)
+  net <- calculate_rdi_by_pairs(CDS, delay, FALSE, arguments$log,
+                                pair_workers, pair_graph)
+  netOut <- calculate_conditioned_rdi_by_pairs(
+    CDS, net, FALSE, arguments$log, pair_workers, pair_graph
+  )
 } else{
   stop("Method must be one of RDI, cRDI, uRDI, or ucRDI. 
        Run Rscript runScribe.R -h for more details.")

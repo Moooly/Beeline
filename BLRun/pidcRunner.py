@@ -22,8 +22,31 @@ class PIDCRunner(Runner):
         PIDC_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if not PIDC_EXPRESSION_FILE.exists():
             ExpressionData = self.read_expression_data()
+            max_genes = self._resolve_max_genes()
+            if max_genes is not None and len(ExpressionData.index) > max_genes:
+                # Stable variance ranking keeps ties in the source-matrix order.
+                # GRNScope normally applies this cap once before confidence
+                # subsampling; this runner-side guard keeps standalone BEELINE
+                # use consistent with the exposed parameter.
+                variances = ExpressionData.var(axis=1, ddof=0)
+                retained_genes = (
+                    variances.sort_values(ascending=False, kind='mergesort')
+                    .head(max_genes)
+                    .index
+                )
+                ExpressionData = ExpressionData.loc[retained_genes]
             ExpressionData.to_csv(PIDC_EXPRESSION_FILE,
                                  sep = '\t', header  = True, index = True)
+
+    def _resolve_max_genes(self):
+        raw = self.params.get('maxGenes')
+        if raw is None:
+            return None
+        try:
+            max_genes = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return max_genes if max_genes >= 3 else None
 
     def run(self):
         '''

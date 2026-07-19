@@ -368,12 +368,19 @@ class Runner(ABC):
                 f"See {resolved_output_path} for details."
             )
 
-    def _run_docker_batch(self, commands) -> None:
+    def _run_docker_batch(
+        self,
+        commands,
+        *,
+        append: bool = False,
+        max_workers: int | None = None,
+        log_prefix: str = 'trajectory',
+    ) -> None:
         commands = list(commands)
         if not commands:
             return
         if len(commands) == 1:
-            self._run_docker(commands[0])
+            self._run_docker(commands[0], append=append)
             return
 
         total_cpu_budget = max(1, int(getattr(self, 'cpu_budget', 1)))
@@ -382,9 +389,11 @@ class Runner(ABC):
             int(getattr(self, 'trajectory_workers', total_cpu_budget)),
         )
         worker_count = min(len(commands), trajectory_workers, total_cpu_budget)
+        if max_workers is not None:
+            worker_count = min(worker_count, max(1, int(max_workers)))
         if worker_count <= 1:
             for index, command in enumerate(commands):
-                self._run_docker(command, append=index > 0)
+                self._run_docker(command, append=append or index > 0)
             return
 
         cpu_per_worker = max(1, total_cpu_budget // worker_count)
@@ -395,7 +404,7 @@ class Runner(ABC):
             else None
         )
         log_paths = [
-            self.output_dir / f'trajectory-{index}.log'
+            self.output_dir / f'{log_prefix}-{index}.log'
             for index in range(len(commands))
         ]
 
@@ -413,7 +422,8 @@ class Runner(ABC):
             for future in futures:
                 future.result()
 
-        with (self.output_dir / 'output.txt').open('w') as combined_output:
+        output_mode = 'a' if append else 'w'
+        with (self.output_dir / 'output.txt').open(output_mode) as combined_output:
             for log_path in log_paths:
                 if log_path.is_file():
                     combined_output.write(log_path.read_text(errors='replace'))

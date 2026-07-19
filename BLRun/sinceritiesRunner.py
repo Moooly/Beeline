@@ -20,6 +20,26 @@ class SINCERITIESRunner(Runner):
 
         ExpressionData = self.read_expression_data()
         PTData = self.read_pseudotime_data()
+        max_genes = self._resolve_max_genes()
+        if max_genes is not None:
+            # The sign step computes a partial-correlation matrix across all
+            # genes separately for each trajectory. Keep fewer genes than the
+            # smallest trajectory's cell count so every matrix is estimable.
+            trajectory_cell_counts = [
+                int(PTData[column].notnull().sum()) for column in PTData.columns
+            ]
+            available_cells = min(
+                trajectory_cell_counts or [len(ExpressionData.columns)]
+            )
+            max_genes = min(max_genes, max(2, available_cells - 1))
+            if len(ExpressionData.index) > max_genes:
+                variances = ExpressionData.var(axis=1, ddof=0)
+                retained_genes = (
+                    variances.sort_values(ascending=False, kind='mergesort')
+                    .head(max_genes)
+                    .index
+                )
+                ExpressionData = ExpressionData.loc[retained_genes]
 
         colNames = PTData.columns
         for idx in range(len(colNames)):
@@ -37,6 +57,16 @@ class SINCERITIESRunner(Runner):
             newExpressionData['Time'] = mid
             newExpressionData.to_csv(self.working_dir / exprName,
                                  sep = ',', header  = True, index = False)
+
+    def _resolve_max_genes(self):
+        raw = self.params.get('maxGenes')
+        if raw is None:
+            return None
+        try:
+            max_genes = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return max_genes if max_genes >= 2 else None
 
     def run(self):
         '''

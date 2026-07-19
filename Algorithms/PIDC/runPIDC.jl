@@ -41,7 +41,7 @@ function compact_network_file(input_path, output_path, limit)
     end
 end
 
-@time genes = get_nodes(dataset_name);
+@time genes = get_nodes(dataset_name; delim='\t');
 
 @time network = InferredNetwork(algorithm, genes);
 
