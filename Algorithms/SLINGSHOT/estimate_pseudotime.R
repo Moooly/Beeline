@@ -87,12 +87,22 @@ if (!is.null(opt$clusters)) {
     fail(sprintf("Cluster file not found: %s", opt$clusters))
   }
   cat(sprintf("Reading cluster labels: %s\n", opt$clusters))
-  cluster_frame <- read.csv(opt$clusters, header = TRUE, row.names = 1, check.names = FALSE)
-  if (ncol(cluster_frame) < 1) {
-    fail("Cluster file must have a cell-name column and a cluster-label column.")
+  # Expected format (matches GRNScope): two columns `cell_id,cluster`, with an
+  # OPTIONAL header row. Read everything as character and auto-detect the header
+  # so both headered and header-less files work, and numeric cluster ids
+  # ("0", "1", ...) aren't coerced to numbers.
+  cluster_frame <- read.csv(opt$clusters, header = FALSE, colClasses = "character",
+                            check.names = FALSE, stringsAsFactors = FALSE)
+  if (ncol(cluster_frame) < 2) {
+    fail("Cluster file must have two columns: cell name and cluster label.")
   }
-  cluster_labels <- as.character(cluster_frame[[1]])
-  names(cluster_labels) <- rownames(cluster_frame)
+  # Drop a header row if its first value isn't one of the expression cells.
+  first_value <- trimws(as.character(cluster_frame[[1]][1]))
+  if (!(first_value %in% cell_names)) {
+    cluster_frame <- cluster_frame[-1, , drop = FALSE]
+  }
+  cluster_labels <- trimws(as.character(cluster_frame[[2]]))
+  names(cluster_labels) <- trimws(as.character(cluster_frame[[1]]))
   cluster_labels <- cluster_labels[cell_names]
   if (any(is.na(cluster_labels))) {
     fail("Some cells in the expression matrix have no matching cluster label.")
