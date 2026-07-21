@@ -15,11 +15,15 @@ FROM bioconductor/bioconductor_docker:RELEASE_3_18
 # CRAN dependency for CLI parsing.
 RUN R --no-save -e "install.packages('optparse', repos='https://cloud.r-project.org')"
 
-# Slingshot (and SingleCellExperiment, pulled in as a dependency) from Bioconductor.
-RUN R --no-save -e "BiocManager::install(c('slingshot', 'SingleCellExperiment'), update = FALSE, ask = FALSE)"
+# Slingshot from Bioconductor. DelayedMatrixStats is only *suggested* by
+# slingshot's dependency chain and is loaded lazily at run time (inside
+# slingshot()), so it must be installed explicitly or the run fails with
+# "there is no package called 'DelayedMatrixStats'".
+RUN R --no-save -e "BiocManager::install(c('slingshot', 'SingleCellExperiment', 'DelayedMatrixStats'), update = FALSE, ask = FALSE)"
 
-# Fail the build early if the packages didn't install.
-RUN R --no-save -e "library(slingshot); library(optparse); cat('deps-ok\n')"
+# Fail the build early if anything (including the lazily-loaded namespaces
+# slingshot() reaches for) is missing.
+RUN R --no-save -e "library(slingshot); library(optparse); loadNamespace('DelayedMatrixStats'); cat('deps-ok\n')"
 
 WORKDIR /app
 COPY estimate_pseudotime.R /app/estimate_pseudotime.R

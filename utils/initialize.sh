@@ -32,9 +32,11 @@ PULL_IMAGES=(
 # Images that MUST be built locally. The default run builds exactly these:
 #   ARBORETO   — contains our modified runArboreto.py (GENIE3 / GRNBOOST2)
 #   CELLORACLE — new algorithm, not published to DockerHub
+#   SLINGSHOT  — new pseudotime estimator, not published to DockerHub
 LOCAL_ONLY_TARGETS=(
     "ARBORETO=grnbeeline/arboreto:base"
     "CELLORACLE=grnbeeline/celloracle:base"
+    "SLINGSHOT=grnbeeline/slingshot:0.1.0"
 )
 
 # Full set for --build / --build-all (rebuild every managed image from source).
@@ -56,6 +58,7 @@ ALL_BUILD_TARGETS=(
     "SCSGL=scsgl:base"
     "SINCERITIES=grnbeeline/sincerities:base"
     "SINGE=grnbeeline/singe:0.4.1"
+    "SLINGSHOT=grnbeeline/slingshot:0.1.0"
 )
 
 show_help() {
@@ -67,6 +70,7 @@ show_help() {
   echo "  2. Build ONLY the images that must be local:"
   echo "       - arboreto   (modified: GENIE3 / GRNBOOST2)"
   echo "       - celloracle (new, not published)"
+  echo "       - slingshot  (new pseudotime estimator, not published)"
   echo "  It does not rebuild images that do not need local changes."
   echo ""
   echo "Options:"
@@ -191,7 +195,7 @@ else
         fi
     done
     echo ""
-    echo "Building the images that must be local (arboreto = modified, celloracle = new)..."
+    echo "Building the images that must be local (arboreto = modified, celloracle + slingshot = new)..."
     build_targets "${LOCAL_ONLY_TARGETS[@]}"
 fi
 
