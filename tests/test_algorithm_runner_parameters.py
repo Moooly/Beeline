@@ -186,6 +186,7 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         grisli, grisli_commands = self.make_runner(
             GRISLIRunner,
             {
+                "maxGenes": 3,
                 "L": 2,
                 "R": 3,
                 "alphaMin": 0.2,
@@ -196,6 +197,61 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         self.assertIn(" 2 3 0.2 ", grisli_commands[0][0])
         self.assertIn("/tmp/grisli-full.csv", grisli_commands[0][0])
         self.assertIn("compactRankMatrix.awk", grisli_commands[0][0])
+
+    def test_grisli_applies_its_highest_variance_gene_filter(self):
+        runner, _commands = self.make_runner(
+            GRISLIRunner,
+            {"maxGenes": 3, "L": 2, "R": 3, "alphaMin": 0.2},
+        )
+        pd.DataFrame(
+            {
+                "cell-0": [0, 0, 0, 1, 0],
+                "cell-1": [0, 1, 2, 1, 3],
+                "cell-2": [0, 2, 4, 1, 6],
+                "cell-3": [0, 3, 6, 1, 9],
+                "cell-4": [0, 4, 8, 1, 12],
+                "cell-5": [0, 5, 10, 1, 15],
+                "cell-6": [0, 6, 12, 1, 18],
+                "cell-7": [0, 7, 14, 1, 21],
+            },
+            index=["gene-a", "gene-b", "gene-c", "gene-d", "gene-e"],
+        ).to_csv(self.input_dir / "ExpressionData.csv")
+
+        runner.generateInputs()
+
+        self.assertEqual(
+            (self.working_dir / "GeneList.txt").read_text().splitlines(),
+            ["gene-e", "gene-c", "gene-b"],
+        )
+
+    def test_grisli_memory_preflight_rejects_unsafe_settings(self):
+        runner, _commands = self.make_runner(
+            GRISLIRunner,
+            {"maxGenes": 1999, "L": 10, "R": 1000, "alphaMin": 0},
+        )
+        runner.memory_budget_mb = 14345
+        runner.cpu_budget = 4
+        runner.trajectory_workers = 1
+
+        with self.assertRaisesRegex(RuntimeError, "Lower GRISLI's Gene filter"):
+            runner._validate_memory_budget(
+                gene_count=1999,
+                trajectory_cell_counts=[818],
+            )
+
+    def test_grisli_memory_preflight_accepts_default_gene_cap(self):
+        runner, _commands = self.make_runner(
+            GRISLIRunner,
+            {"maxGenes": 500, "L": 10, "R": 1000, "alphaMin": 0},
+        )
+        runner.memory_budget_mb = 14345
+        runner.cpu_budget = 4
+        runner.trajectory_workers = 1
+
+        runner._validate_memory_budget(
+            gene_count=500,
+            trajectory_cell_counts=[818],
+        )
 
     def test_phase6_entrypoints_receive_the_output_limit(self):
         pidc, pidc_commands = self.make_runner(
@@ -255,6 +311,30 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
             / "runPIDC.jl"
         ).read_text(encoding="utf-8")
         self.assertIn("get_nodes(dataset_name; delim='\\t')", script)
+
+    def test_grnvbem_applies_its_highest_variance_gene_filter(self):
+        runner, _commands = self.make_runner(
+            GRNVBEMRunner,
+            {"maxGenes": 3},
+        )
+        pd.DataFrame(
+            {
+                "cell-0": [0, 0, 0, 1, 0],
+                "cell-1": [0, 1, 2, 1, 3],
+                "cell-2": [0, 2, 4, 1, 6],
+                "cell-3": [0, 3, 6, 1, 9],
+                "cell-4": [0, 4, 8, 1, 12],
+                "cell-5": [0, 5, 10, 1, 15],
+                "cell-6": [0, 6, 12, 1, 18],
+                "cell-7": [0, 7, 14, 1, 21],
+            },
+            index=["gene-a", "gene-b", "gene-c", "gene-d", "gene-e"],
+        ).to_csv(self.input_dir / "ExpressionData.csv")
+
+        runner.generateInputs()
+
+        generated = pd.read_csv(self.working_dir / "ExpressionData0.csv")
+        self.assertEqual(list(generated["GENES"]), ["gene-e", "gene-c", "gene-b"])
 
     def test_scsgl_forwards_density_and_association_parameters(self):
         runner, commands = self.make_runner(

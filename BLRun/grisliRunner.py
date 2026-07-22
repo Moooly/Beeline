@@ -20,6 +20,26 @@ class GRISLIRunner(Runner):
 
         ExpressionData = self.read_expression_data()
         PTData = self.read_pseudotime_data()
+        max_genes = self._resolve_max_genes()
+        if max_genes is not None and len(ExpressionData.index) > max_genes:
+            # GRNScope normally applies this once before confidence
+            # subsampling. Keep standalone BEELINE runs consistent and make
+            # variance ties deterministic.
+            variances = ExpressionData.var(axis=1, ddof=0)
+            retained_genes = (
+                variances.sort_values(ascending=False, kind='mergesort')
+                .head(max_genes)
+                .index
+            )
+            ExpressionData = ExpressionData.loc[retained_genes]
+
+        trajectory_cell_counts = [
+            int(PTData[column].notnull().sum()) for column in PTData.columns
+        ]
+        self._validate_memory_budget(
+            gene_count=len(ExpressionData.index),
+            trajectory_cell_counts=trajectory_cell_counts,
+        )
         (self.working_dir / 'GeneList.txt').write_text(
             '\n'.join(str(gene) for gene in ExpressionData.index) + '\n',
             encoding='utf-8',
@@ -41,6 +61,90 @@ class GRISLIRunner(Runner):
             ptDF = PTData.loc[index,[colName]]
             ptDF.to_csv(self.working_dir / cellName,
                                      sep = '\t', header  = False, index = False)
+
+    def _resolve_max_genes(self):
+        raw = self.params.get('maxGenes')
+        if raw is None:
+            return None
+        try:
+            max_genes = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return max_genes if max_genes >= 3 else None
+
+    def _resolve_stability_iterations(self):
+        try:
+            iterations = int(self.params.get('R', 1000))
+        except (TypeError, ValueError):
+            return 1000
+        return max(1, iterations)
+
+    @staticmethod
+    def _estimate_peak_memory_bytes(gene_count, cell_count, iterations):
+        '''Estimate the two dominant dense allocations in the GRISLI code.'''
+        # For trajectories below 2,000 cells, VelocityInference.m builds
+        # several C x C x G double tensors. Above that threshold it switches
+        # to a lower-memory loop, but still keeps several C x C/G x G arrays.
+        if cell_count < 2000:
+            velocity_bytes = 24 * cell_count * cell_count * gene_count
+        else:
+            velocity_bytes = (
+                64 * cell_count * cell_count
+                + 24 * cell_count * gene_count
+            )
+
+        # Compute_A_app_wo_ref.m stores the full G x G x R selection history
+        # as uint32, alongside dense double G x G working matrices.
+        stability_bytes = (
+            4 * gene_count * gene_count * iterations
+            + 24 * gene_count * gene_count
+        )
+        return max(velocity_bytes, stability_bytes)
+
+    def _validate_memory_budget(self, *, gene_count, trajectory_cell_counts):
+        total_memory_mb = getattr(self, 'memory_budget_mb', None)
+        if total_memory_mb is None or not trajectory_cell_counts:
+            return
+
+        cpu_budget = max(1, int(getattr(self, 'cpu_budget', 1)))
+        trajectory_workers = max(
+            1,
+            int(getattr(self, 'trajectory_workers', cpu_budget)),
+        )
+        parallel_trajectories = min(
+            len(trajectory_cell_counts),
+            trajectory_workers,
+            cpu_budget,
+        )
+        memory_per_worker_mb = max(
+            512,
+            int(total_memory_mb) // parallel_trajectories,
+        )
+        # Leave headroom for MATLAB Runtime, Docker, and allocations not
+        # represented by the two dominant tensors above.
+        safe_memory_bytes = memory_per_worker_mb * 1024 * 1024 * 0.70
+        iterations = self._resolve_stability_iterations()
+        peak_cell_count = max(trajectory_cell_counts)
+        estimated_peak_bytes = self._estimate_peak_memory_bytes(
+            gene_count,
+            peak_cell_count,
+            iterations,
+        )
+        if estimated_peak_bytes <= safe_memory_bytes:
+            return
+
+        estimated_gib = estimated_peak_bytes / (1024 ** 3)
+        safe_gib = safe_memory_bytes / (1024 ** 3)
+        raise RuntimeError(
+            "GRISLI cannot start safely with the current settings. "
+            f"Its estimated peak memory is {estimated_gib:.1f} GiB for "
+            f"{gene_count:,} genes, {peak_cell_count:,} trajectory cells, and "
+            f"{iterations:,} stability iterations, above the {safe_gib:.1f} GiB "
+            "safe allowance. Lower GRISLI's Gene filter or Stability "
+            "iterations in parameter settings and try again. Lowering Gene "
+            "filter reduces both major memory costs; lowering Stability "
+            "iterations reduces only the stability-selection cost."
+        )
 
     def run(self):
         '''
