@@ -1,7 +1,15 @@
+import importlib.util
+import sys
 import tempfile
+import threading
+import time
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
 
 from BLRun import celloracleRunner as celloracle_runner
 from BLRun.celloracleRunner import CellOracleRunner
@@ -138,6 +146,192 @@ class CellOraclePhase5Tests(unittest.TestCase):
         self.assertIn("--maxGenes 2000", joined)
         self.assertIn("--maxCells 300", joined)
         self.assertIn("--nJobs 3", joined)
+
+    def test_expression_input_is_published_atomically(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = self.make_runner(Path(temp_dir) / "output")
+            expression = pd.DataFrame(
+                [[1, 2], [3, 4]],
+                index=["GeneA", "GeneB"],
+                columns=["Cell1", "Cell2"],
+            )
+            runner.read_expression_data = lambda: expression
+
+            runner.generateInputs()
+
+            written = pd.read_csv(
+                runner.working_dir / "ExpressionData.csv", index_col=0
+            )
+            pd.testing.assert_frame_equal(written, expression)
+            self.assertEqual(list(runner.working_dir.glob(".*.tmp")), [])
+
+    @staticmethod
+    def load_in_container_script():
+        script_path = (
+            Path(celloracle_runner.__file__).resolve().parents[1]
+            / "Algorithms"
+            / "CELLORACLE"
+            / "runCellOracle.py"
+        )
+        fake_anndata = types.ModuleType("anndata")
+        fake_anndata.AnnData = object
+        fake_celloracle = types.ModuleType("celloracle")
+        fake_celloracle.Oracle = object
+        fake_celloracle.data = types.SimpleNamespace(
+            **{
+                name: (lambda: None)
+                for name in (
+                    "load_human_promoter_base_GRN",
+                    "load_mouse_promoter_base_GRN",
+                    "load_rat_promoter_base_GRN",
+                    "load_Pig_promoter_base_GRN",
+                    "load_chicken_promoter_base_GRN",
+                    "load_zebrafish_promoter_base_GRN",
+                    "load_xenopus_tropicalis_promoter_base_GRN",
+                    "load_drosophila_promoter_base_GRN",
+                    "load_Celegans_promoter_base_GRN",
+                    "load_Scerevisiae_promoter_base_GRN",
+                )
+            }
+        )
+        fake_scanpy = types.ModuleType("scanpy")
+        fake_scanpy.pp = types.SimpleNamespace()
+        module_name = "celloracle_in_container_test"
+        spec = importlib.util.spec_from_file_location(module_name, script_path)
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(
+            sys.modules,
+            {
+                "anndata": fake_anndata,
+                "celloracle": fake_celloracle,
+                "scanpy": fake_scanpy,
+            },
+        ):
+            spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def load_perturbation_script():
+        script_path = (
+            Path(celloracle_runner.__file__).resolve().parents[1]
+            / "Algorithms"
+            / "CELLORACLE"
+            / "runCellOraclePerturbation.py"
+        )
+        fake_anndata = types.ModuleType("anndata")
+        fake_anndata.AnnData = object
+        fake_celloracle = types.ModuleType("celloracle")
+        fake_celloracle.Oracle = object
+        fake_applications = types.ModuleType("celloracle.applications")
+        fake_applications.Gradient_calculator = object
+        fake_applications.Oracle_development_module = object
+        fake_celloracle.applications = fake_applications
+        fake_scanpy = types.ModuleType("scanpy")
+        fake_distributions = types.ModuleType("perturbation_distributions")
+        fake_distributions.summarize_expression_distribution = lambda **_: {}
+        module_name = "celloracle_perturbation_test"
+        spec = importlib.util.spec_from_file_location(module_name, script_path)
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(
+            sys.modules,
+            {
+                "anndata": fake_anndata,
+                "celloracle": fake_celloracle,
+                "celloracle.applications": fake_applications,
+                "scanpy": fake_scanpy,
+                "perturbation_distributions": fake_distributions,
+            },
+        ):
+            spec.loader.exec_module(module)
+        return module
+
+    def test_development_field_uses_exact_scoring_flow_and_simulation_mask(self):
+        module = self.load_perturbation_script()
+        coordinates = np.asarray(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+        )
+        reference_flow = np.asarray(
+            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
+        )
+        trajectory_perturbation_flow = np.asarray(
+            [[2.0, 0.0], [0.0, -3.0], [4.0, 0.0], [0.0, -5.0]]
+        )
+        inner_product = np.sum(
+            reference_flow * trajectory_perturbation_flow,
+            axis=1,
+        )
+        gradient = types.SimpleNamespace(
+            gridpoints_coordinates=coordinates,
+            mass_filter=np.asarray([False, True, False, False]),
+            ref_flow=reference_flow,
+        )
+        development = types.SimpleNamespace(
+            gridpoints_coordinates=coordinates,
+            mass_filter_reference=np.asarray([False, True, False, False]),
+            mass_filter_simulation=np.asarray([False, False, True, False]),
+            ref_flow=reference_flow,
+            flow=trajectory_perturbation_flow,
+            inner_product=inner_product,
+        )
+
+        field = module.extract_development_field(gradient, development)
+
+        self.assertEqual(
+            [(row["x"], row["y"]) for row in field["development_vectors"]],
+            [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)],
+        )
+        perturbation_rows = field["development_perturbation_vectors"]
+        score_rows = field["inner_product_grid"]
+        self.assertEqual(
+            [(row["x"], row["y"]) for row in perturbation_rows],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+        )
+        self.assertEqual(
+            [(row["x"], row["y"]) for row in score_rows],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+        )
+
+        reference_by_coordinate = {
+            tuple(coordinates[index]): reference_flow[index]
+            for index in range(len(coordinates))
+        }
+        for vector, score in zip(perturbation_rows, score_rows):
+            coordinate = (vector["x"], vector["y"])
+            expected_score = float(
+                np.dot(
+                    np.asarray([vector["dx"], vector["dy"]]),
+                    reference_by_coordinate[coordinate],
+                )
+            )
+            self.assertEqual(score["score"], expected_score)
+
+    def test_container_waits_for_delayed_bind_mount_contents(self):
+        module = self.load_in_container_script()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "ExpressionData.csv"
+            input_path.touch()
+            expected = pd.DataFrame(
+                [[1, 2], [3, 4]],
+                index=["GeneA", "GeneB"],
+                columns=["Cell1", "Cell2"],
+            )
+
+            def publish_contents():
+                time.sleep(0.08)
+                expected.to_csv(input_path)
+
+            writer = threading.Thread(target=publish_contents)
+            writer.start()
+            try:
+                observed = module.read_expression_when_ready(
+                    input_path,
+                    timeout_seconds=1.0,
+                    poll_interval_seconds=0.01,
+                )
+            finally:
+                writer.join()
+
+            pd.testing.assert_frame_equal(observed, expected)
 
 
 if __name__ == "__main__":

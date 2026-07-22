@@ -39,6 +39,25 @@ def _runtime_mount_root(output_dir: Path) -> Path:
     return resolved.parents[2]
 
 
+def _write_dataframe_atomic(dataframe: pd.DataFrame, destination: Path) -> None:
+    """Publish a complete CSV to Docker-backed storage in one rename."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = destination.with_name(
+        f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary_path.open("w", encoding="utf-8", newline="") as handle:
+            dataframe.to_csv(handle, sep=",", header=True, index=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 class _CellOracleDockerWorker:
     def __init__(
         self,
@@ -247,8 +266,7 @@ class CellOracleRunner(Runner):
         CELLORACLE_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if not CELLORACLE_EXPRESSION_FILE.exists():
             ExpressionData = self.read_expression_data()
-            ExpressionData.to_csv(CELLORACLE_EXPRESSION_FILE,
-                                  sep=',', header=True, index=True)
+            _write_dataframe_atomic(ExpressionData, CELLORACLE_EXPRESSION_FILE)
 
     def run(self):
         '''

@@ -47,6 +47,9 @@ PROMOTER_BASE_GRN_LOADERS = {
 }
 
 GRN_UNIT_COLUMN = "grn_unit"
+INPUT_READY_TIMEOUT_SECONDS = 10.0
+INPUT_READY_POLL_INTERVAL_SECONDS = 0.05
+INPUT_STABLE_OBSERVATIONS = 2
 
 
 @lru_cache(maxsize=2)
@@ -97,6 +100,60 @@ def parse_args(argv):
     parser.add_argument("--maxCells", type=int, default=0, help="subsample cells (0 = no cap)")
     parser.add_argument("--nJobs", type=int, default=max(1, os.cpu_count() or 1))
     return parser.parse_args(argv)
+
+
+def read_expression_when_ready(
+    path,
+    *,
+    timeout_seconds: float = INPUT_READY_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = INPUT_READY_POLL_INTERVAL_SECONDS,
+) -> pd.DataFrame:
+    """Wait for a bind-mounted CSV to become complete and readable.
+
+    Docker Desktop can expose a newly created bind-mounted filename before its
+    contents have propagated into a long-lived container. Requiring a nonzero,
+    stable size avoids treating that transient empty file as algorithm output.
+    """
+    input_path = Path(path)
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    previous_size = None
+    stable_observations = 0
+    last_error = None
+
+    while True:
+        try:
+            current_size = input_path.stat().st_size
+            if current_size > 0:
+                if current_size == previous_size:
+                    stable_observations += 1
+                else:
+                    stable_observations = 1
+                previous_size = current_size
+
+                if stable_observations >= INPUT_STABLE_OBSERVATIONS:
+                    try:
+                        expression = pd.read_csv(input_path, index_col=0)
+                        if expression.empty:
+                            raise ValueError("Expression matrix is empty.")
+                        return expression
+                    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError) as exc:
+                        last_error = exc
+                        stable_observations = 0
+            else:
+                previous_size = current_size
+                stable_observations = 0
+        except OSError as exc:
+            last_error = exc
+            previous_size = None
+            stable_observations = 0
+
+        if time.monotonic() >= deadline:
+            detail = f" Last read error: {last_error}" if last_error else ""
+            raise RuntimeError(
+                "CellOracle input file did not become complete and readable "
+                f"within {timeout_seconds:g} seconds: {input_path}.{detail}"
+            )
+        time.sleep(max(0.001, poll_interval_seconds))
 
 
 def build_anndata(expression: pd.DataFrame, max_genes: int, max_cells: int) -> ad.AnnData:
@@ -202,9 +259,7 @@ def extract_edges(links, p_value_cutoff: float, top_k: int) -> pd.DataFrame:
 
 
 def execute_inference(args):
-    expression = pd.read_csv(args.inFile, index_col=0)
-    if expression.empty:
-        raise ValueError("Expression matrix is empty.")
+    expression = read_expression_when_ready(args.inFile)
 
     adata = build_anndata(expression, args.maxGenes, args.maxCells)
     adata, n_comps, embedding_name = preprocess_for_celloracle(adata)

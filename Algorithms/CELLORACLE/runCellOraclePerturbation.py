@@ -446,64 +446,148 @@ def unavailable_ps_metrics(reason: str) -> dict:
     }
 
 
+def _coerce_grid_array(values, n_points: int) -> "np.ndarray | None":
+    """Coerce a CellOracle grid attribute into a 2-D ``(n_points, k)`` float
+    array, transposing if it arrives column-major. Returns None on failure."""
+    try:
+        arr = np.asarray(values, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim > 2:
+        # e.g. an (n_grid, n_grid, k) field — flatten the spatial axes.
+        arr = arr.reshape(-1, arr.shape[-1])
+    if arr.shape[0] != n_points and arr.shape[-1] == n_points:
+        arr = arr.T
+    return arr
+
+
+def _first_present(*candidates):
+    """Return the first non-None attribute from ``(obj, name)`` candidates."""
+    for obj, name in candidates:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _kept_grid_indices(mask_values, n_points: int) -> list[int]:
+    """Return grid indices not excluded by a CellOracle density mask.
+
+    CellOracle keeps separate masks for the pseudotime reference field and the
+    trajectory-specific perturbation field. A missing or incompatible mask is
+    treated as unfiltered so older CellOracle releases remain usable.
+    """
+    if mask_values is None:
+        return list(range(n_points))
+    try:
+        mask = np.asarray(mask_values, dtype=bool).ravel()
+    except (TypeError, ValueError):
+        return list(range(n_points))
+    if len(mask) != n_points:
+        return list(range(n_points))
+    return np.flatnonzero(~mask).astype(int).tolist()
+
+
 def extract_development_field(gradient, development) -> dict:
     """Pull the drawable development vector field and the per-grid inner-product
     (promotes/blocks) values out of the CellOracle objects for the client to
-    visualize. Everything is wrapped defensively: if an attribute is missing on
-    the installed CellOracle version we simply omit that field rather than fail
-    the run. Grid points filtered out by the mass filter (low cell density) are
-    dropped, and only finite rows are kept. Coordinates are in embedding space,
-    the same space as ``grid_vectors``, so the client overlays them directly.
+    visualize.
+
+    All values come from the ``development`` module's shared grid. Reference
+    arrows use CellOracle's reference-density mask; perturbation arrows and
+    inner-product values use ``mass_filter_simulation``, matching the points used
+    by ``calculate_digitized_ip``. Everything is wrapped defensively: a missing
+    attribute on the installed CellOracle version omits that field rather than
+    failing the run. Coordinates remain in embedding space.
     """
     field: dict = {}
 
-    # Development reference vector field — arrows following pseudotime.
-    try:
-        coords = np.asarray(gradient.gridpoints_coordinates, dtype=float)
-        vectors = np.asarray(gradient.gradient, dtype=float)
-        mask = np.asarray(
-            getattr(gradient, "mass_filter", np.zeros(len(coords), dtype=bool)),
-            dtype=bool,
-        )
+    coords_raw = _first_present(
+        (development, "gridpoints_coordinates"),
+        (gradient, "gridpoints_coordinates"),
+    )
+    if coords_raw is None:
+        return field
+    coords = _coerce_grid_array(coords_raw, 0)
+    if coords is None or coords.ndim != 2 or coords.shape[0] == 0 or coords.shape[1] < 2:
+        return field
+    n_points = coords.shape[0]
+
+    reference_kept = _kept_grid_indices(
+        _first_present(
+            (development, "mass_filter_reference"),
+            (gradient, "mass_filter"),
+        ),
+        n_points,
+    )
+    simulation_kept = _kept_grid_indices(
+        _first_present(
+            (development, "mass_filter_simulation"),
+            (development, "mass_filter_reference"),
+            (gradient, "mass_filter"),
+        ),
+        n_points,
+    )
+
+    # Development reference vector field — arrows following pseudotime. This is
+    # the same ``ref_flow`` the inner product multiplies against, so it aligns
+    # 1:1 with the promotes/blocks grid below.
+    ref_flow = _coerce_grid_array(
+        _first_present(
+            (development, "ref_flow"),
+            (gradient, "ref_flow"),
+            (gradient, "gradient"),
+        ),
+        n_points,
+    )
+    if ref_flow is not None and ref_flow.shape[1] >= 2:
         rows = []
-        for i in range(min(len(coords), len(vectors))):
-            if i < len(mask) and mask[i]:
+        for i in reference_kept:
+            if i >= len(ref_flow):
                 continue
-            x, y, dx, dy = coords[i, 0], coords[i, 1], vectors[i, 0], vectors[i, 1]
+            x, y, dx, dy = coords[i, 0], coords[i, 1], ref_flow[i, 0], ref_flow[i, 1]
             if np.isfinite([x, y, dx, dy]).all():
                 rows.append({"x": float(x), "y": float(y), "dx": float(dx), "dy": float(dy)})
         if rows:
             field["development_vectors"] = rows
-    except Exception:
-        pass
+
+    # Exact trajectory-specific perturbation field used by CellOracle in
+    # ``inner_product = dot(flow, ref_flow)``. This may differ from the Oracle's
+    # whole-population ``flow`` exported as ``grid_vectors``.
+    perturbation_flow = _coerce_grid_array(
+        getattr(development, "flow", None), n_points
+    )
+    if perturbation_flow is not None and perturbation_flow.shape[1] >= 2:
+        rows = []
+        for i in simulation_kept:
+            if i >= len(perturbation_flow):
+                continue
+            x, y, dx, dy = (
+                coords[i, 0],
+                coords[i, 1],
+                perturbation_flow[i, 0],
+                perturbation_flow[i, 1],
+            )
+            if np.isfinite([x, y, dx, dy]).all():
+                rows.append({"x": float(x), "y": float(y), "dx": float(dx), "dy": float(dy)})
+        if rows:
+            field["development_perturbation_vectors"] = rows
 
     # Per-grid inner product — positive = perturbation pushes cells WITH
     # development (promotes), negative = AGAINST (blocks).
-    try:
-        coords = np.asarray(
-            getattr(development, "gridpoints_coordinates", gradient.gridpoints_coordinates),
-            dtype=float,
-        )
-        inner = np.asarray(development.inner_product, dtype=float).ravel()
-        mask = np.asarray(
-            getattr(
-                development,
-                "mass_filter",
-                getattr(gradient, "mass_filter", np.zeros(len(coords), dtype=bool)),
-            ),
-            dtype=bool,
-        )
+    inner = _coerce_grid_array(getattr(development, "inner_product", None), n_points)
+    if inner is not None:
         rows = []
-        for i in range(min(len(coords), len(inner))):
-            if i < len(mask) and mask[i]:
+        for i in simulation_kept:
+            if i >= len(inner):
                 continue
-            x, y, score = coords[i, 0], coords[i, 1], inner[i]
+            x, y, score = coords[i, 0], coords[i, 1], inner[i, 0]
             if np.isfinite([x, y, score]).all():
                 rows.append({"x": float(x), "y": float(y), "score": float(score)})
         if rows:
             field["inner_product_grid"] = rows
-    except Exception:
-        pass
 
     return field
 
@@ -607,6 +691,10 @@ def attach_perturbation_score_metrics(
     result.update(global_metrics)
     if development_field.get("development_vectors"):
         result["development_vectors"] = development_field["development_vectors"]
+    if development_field.get("development_perturbation_vectors"):
+        result["development_perturbation_vectors"] = development_field[
+            "development_perturbation_vectors"
+        ]
     if development_field.get("inner_product_grid"):
         result["inner_product_grid"] = development_field["inner_product_grid"]
 
