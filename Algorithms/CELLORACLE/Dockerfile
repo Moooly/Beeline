@@ -45,7 +45,12 @@ RUN pip install --no-cache-dir "setuptools<81"
 # network access. Cache under a fixed, world-readable HOME.
 ENV HOME=/root
 COPY prefetch_base_grns.py /
-RUN python /prefetch_base_grns.py && chmod -R a+rX /root/.celloracle 2>/dev/null || true
+# Prefetch MUST succeed — if it can't cache the base GRNs the build has to fail,
+# otherwise the image ships broken and CellOracle dies at runtime with
+# "No columns to parse from file". The chmod stays best-effort (its own line so
+# its `|| true` can't mask a prefetch failure).
+RUN python /prefetch_base_grns.py
+RUN chmod -R a+rX /root/.celloracle 2>/dev/null || true
 
 COPY runCellOracle.py /
 COPY runCellOraclePerturbation.py /

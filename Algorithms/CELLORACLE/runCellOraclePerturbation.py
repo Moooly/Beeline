@@ -446,7 +446,71 @@ def unavailable_ps_metrics(reason: str) -> dict:
     }
 
 
-def calculate_ps_metrics(oracle, cell_indices: np.ndarray, n_jobs: int) -> dict:
+def extract_development_field(gradient, development) -> dict:
+    """Pull the drawable development vector field and the per-grid inner-product
+    (promotes/blocks) values out of the CellOracle objects for the client to
+    visualize. Everything is wrapped defensively: if an attribute is missing on
+    the installed CellOracle version we simply omit that field rather than fail
+    the run. Grid points filtered out by the mass filter (low cell density) are
+    dropped, and only finite rows are kept. Coordinates are in embedding space,
+    the same space as ``grid_vectors``, so the client overlays them directly.
+    """
+    field: dict = {}
+
+    # Development reference vector field — arrows following pseudotime.
+    try:
+        coords = np.asarray(gradient.gridpoints_coordinates, dtype=float)
+        vectors = np.asarray(gradient.gradient, dtype=float)
+        mask = np.asarray(
+            getattr(gradient, "mass_filter", np.zeros(len(coords), dtype=bool)),
+            dtype=bool,
+        )
+        rows = []
+        for i in range(min(len(coords), len(vectors))):
+            if i < len(mask) and mask[i]:
+                continue
+            x, y, dx, dy = coords[i, 0], coords[i, 1], vectors[i, 0], vectors[i, 1]
+            if np.isfinite([x, y, dx, dy]).all():
+                rows.append({"x": float(x), "y": float(y), "dx": float(dx), "dy": float(dy)})
+        if rows:
+            field["development_vectors"] = rows
+    except Exception:
+        pass
+
+    # Per-grid inner product — positive = perturbation pushes cells WITH
+    # development (promotes), negative = AGAINST (blocks).
+    try:
+        coords = np.asarray(
+            getattr(development, "gridpoints_coordinates", gradient.gridpoints_coordinates),
+            dtype=float,
+        )
+        inner = np.asarray(development.inner_product, dtype=float).ravel()
+        mask = np.asarray(
+            getattr(
+                development,
+                "mass_filter",
+                getattr(gradient, "mass_filter", np.zeros(len(coords), dtype=bool)),
+            ),
+            dtype=bool,
+        )
+        rows = []
+        for i in range(min(len(coords), len(inner))):
+            if i < len(mask) and mask[i]:
+                continue
+            x, y, score = coords[i, 0], coords[i, 1], inner[i]
+            if np.isfinite([x, y, score]).all():
+                rows.append({"x": float(x), "y": float(y), "score": float(score)})
+        if rows:
+            field["inner_product_grid"] = rows
+    except Exception:
+        pass
+
+    return field
+
+
+def calculate_ps_metrics(
+    oracle, cell_indices: np.ndarray, n_jobs: int, capture_field: bool = False
+) -> dict:
     if len(cell_indices) < 20:
         return unavailable_ps_metrics("Too few cells have pseudotime in this scope.")
 
@@ -493,7 +557,7 @@ def calculate_ps_metrics(oracle, cell_indices: np.ndarray, n_jobs: int) -> dict:
         p_value = None
 
     p_value = optional_finite_float(p_value) if p_value is not None else None
-    return {
+    metrics = {
         "perturbation_score": perturbation_score,
         "perturbation_score_p_value": p_value,
         "perturbation_score_direction": direction,
@@ -502,6 +566,9 @@ def calculate_ps_metrics(oracle, cell_indices: np.ndarray, n_jobs: int) -> dict:
             None if p_value is not None else "The paired Wilcoxon test could not be calculated."
         ),
     }
+    if capture_field:
+        metrics["_development_field"] = extract_development_field(gradient, development)
+    return metrics
 
 
 def attach_perturbation_score_metrics(
@@ -531,9 +598,17 @@ def attach_perturbation_score_metrics(
     result["pseudotime_trajectory"] = trajectory_name
     result["pseudotime_cell_count"] = int(len(trajectory_indices))
     try:
-        result.update(calculate_ps_metrics(oracle, trajectory_indices, args.n_jobs))
+        global_metrics = calculate_ps_metrics(
+            oracle, trajectory_indices, args.n_jobs, capture_field=True
+        )
     except Exception as exc:
-        result.update(unavailable_ps_metrics(f"Perturbation Score calculation failed: {exc}"))
+        global_metrics = unavailable_ps_metrics(f"Perturbation Score calculation failed: {exc}")
+    development_field = global_metrics.pop("_development_field", {})
+    result.update(global_metrics)
+    if development_field.get("development_vectors"):
+        result["development_vectors"] = development_field["development_vectors"]
+    if development_field.get("inner_product_grid"):
+        result["inner_product_grid"] = development_field["inner_product_grid"]
 
     clusters = oracle.adata.obs[CLUSTER_COLUMN].astype(str).to_numpy()
     trajectory_mask = np.zeros(len(clusters), dtype=bool)

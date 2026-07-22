@@ -20,9 +20,23 @@ LOADERS = [
     co.data.load_mouse_scATAC_atlas_base_GRN,
 ]
 
+failures = []
 for loader in LOADERS:
     try:
         loader()
         print(f"cached: {loader.__name__}")
-    except Exception as exc:  # noqa: BLE001 - best effort; log and continue
-        print(f"WARNING: failed to pre-cache {loader.__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - collect and report below
+        print(f"ERROR: failed to pre-cache {loader.__name__}: {exc}")
+        failures.append(loader.__name__)
+
+# Fail the build if any base GRN could not be cached. Otherwise the image ships
+# with a missing/empty base-GRN cache and CellOracle later dies at runtime with
+# a generic "No columns to parse from file" (the --rm containers have no network
+# to re-download). Prefetch failures are usually transient — re-run the build.
+if failures:
+    raise SystemExit(
+        "Base-GRN prefetch failed for: "
+        + ", ".join(failures)
+        + ". This is usually a transient network error — re-run the build."
+    )
+print("All base GRNs cached successfully.")
