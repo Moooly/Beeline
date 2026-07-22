@@ -48,15 +48,17 @@ Rscript estimate_pseudotime.R \
 
 ### Output format
 
-`PseudoTime.csv` in BEELINE format — cells × lineages:
+`PseudoTime.csv` — cells × lineages, with an empty corner cell heading the
+cell-name column:
 
 ```
-PseudoTime1,PseudoTime2
+,PseudoTime1,PseudoTime2
 CELL_A,114.76,NA
 CELL_B,NA,78.73
 ```
 
-- Header lists one column per recovered Slingshot lineage (`PseudoTime1`, `PseudoTime2`, …).
+- The header's first cell is empty (the cell-name/index column); the rest are one
+  column per recovered Slingshot lineage (`PseudoTime1`, `PseudoTime2`, …).
 - Each row is `<cell name>,<value|NA>,…`; `NA` means the cell is not on that lineage.
 - Read back with `pandas.read_csv(path, index_col=0)`.
 

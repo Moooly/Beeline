@@ -150,19 +150,20 @@ colnames(pseudotime) <- paste0("PseudoTime", seq_len(ncol(pseudotime)))
 rownames(pseudotime) <- cell_names
 cat(sprintf("Recovered %d lineage(s) across %d cells\n", ncol(pseudotime), nrow(pseudotime)))
 
-# --- 7. Write BEELINE-compatible PseudoTime.csv ------------------------------
-# BEELINE format: header lists the lineage columns only (no corner cell), each
-# data row is `<cell>,<value|NA>,...`. `col.names = TRUE, row.names = TRUE`
-# produces exactly that shifted header, which pandas reads with index_col=0.
-suppressWarnings(
-  write.table(
-    pseudotime,
-    file = opt$output,
-    sep = ",",
-    quote = FALSE,
-    col.names = TRUE,
-    row.names = TRUE,
-    na = "NA"
-  )
+# --- 7. Write PseudoTime.csv -------------------------------------------------
+# Standard index+lineage layout: an empty corner cell heads the cell-name
+# column, then one column per Slingshot lineage. `col.names = NA` writes that
+# empty corner, so the header lines up with the data rows in any viewer and
+# pandas still reads it cleanly with index_col=0:
+#     ,PseudoTime1,PseudoTime2
+#     CELL_A,114.76,NA
+write.table(
+  pseudotime,
+  file = opt$output,
+  sep = ",",
+  quote = FALSE,
+  col.names = NA,
+  row.names = TRUE,
+  na = "NA"
 )
 cat(sprintf("Wrote %s\n", opt$output))
