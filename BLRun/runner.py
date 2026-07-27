@@ -9,6 +9,7 @@ from math import isfinite
 import os
 from pathlib import Path
 import subprocess
+import numpy as np
 import pandas as pd
 
 
@@ -135,6 +136,7 @@ class Runner(ABC):
             Path(str(selected_cells_file)).resolve() if selected_cells_file else None
         )
         self._selected_cells_cache = None
+        self._selected_cell_records_cache = None
         self._expression_view_cache = None
         self._pseudotime_view_cache = None
         self.groundTruthNetwork = ds.get('groundTruthNetwork', 'GroundTruthNetwork.csv')
@@ -201,18 +203,43 @@ class Runner(ABC):
                 else:
                     os.environ[key] = previous_value
 
-    def _selected_cell_names(self):
+    def _selected_cell_records(self):
         selected_cells_file = getattr(self, 'selected_cells_file', None)
         if selected_cells_file is None:
             return None
-        if getattr(self, '_selected_cells_cache', None) is None:
+        if getattr(self, '_selected_cell_records_cache', None) is None:
             values = json.loads(
                 selected_cells_file.read_text(encoding='utf-8')
             )
             if not isinstance(values, list):
                 raise ValueError('selectedCellsFile must contain a JSON list.')
-            self._selected_cells_cache = [str(value) for value in values]
-        return self._selected_cells_cache
+            records = []
+            for value in values:
+                if isinstance(value, dict):
+                    source = str(value.get('source', '')).strip()
+                    output = str(value.get('output', '')).strip()
+                else:
+                    source = str(value).strip()
+                    output = source
+                if not source or not output:
+                    raise ValueError(
+                        'selectedCellsFile entries require non-empty source and output names.'
+                    )
+                records.append({'source': source, 'output': output})
+            output_names = [record['output'] for record in records]
+            if len(output_names) != len(set(output_names)):
+                raise ValueError(
+                    'selectedCellsFile output cell identifiers must be unique.'
+                )
+            self._selected_cell_records_cache = records
+            self._selected_cells_cache = [record['source'] for record in records]
+        return self._selected_cell_records_cache
+
+    def _selected_cell_names(self):
+        records = self._selected_cell_records()
+        if records is None:
+            return None
+        return [record['source'] for record in records]
 
     def expression_input_path(self) -> Path:
         return getattr(self, 'expression_source', None) or (
@@ -230,20 +257,31 @@ class Runner(ABC):
             return cached_view.copy(deep=False)
 
         expression = _read_cached_dataframe(self.expression_input_path())
-        selected_cells = self._selected_cell_names()
-        if selected_cells is None:
+        selected_records = self._selected_cell_records()
+        if selected_records is None:
             selected_expression = expression.copy()
             self._expression_view_cache = selected_expression
             return selected_expression.copy(deep=False)
 
         column_lookup = {str(column): column for column in expression.columns}
-        missing = [cell for cell in selected_cells if cell not in column_lookup]
+        missing = [
+            record['source']
+            for record in selected_records
+            if record['source'] not in column_lookup
+        ]
         if missing:
             raise ValueError(
                 f'{len(missing)} selected cells are missing from the expression matrix.'
             )
-        selected_columns = [column_lookup[cell] for cell in selected_cells]
+        selected_columns = [
+            column_lookup[record['source']]
+            for record in selected_records
+        ]
         selected_expression = expression.loc[:, selected_columns].copy()
+        selected_expression.columns = [
+            record['output']
+            for record in selected_records
+        ]
         self._expression_view_cache = selected_expression
         return selected_expression.copy(deep=False)
 
@@ -252,18 +290,66 @@ class Runner(ABC):
         if cached_view is not None:
             return cached_view.copy(deep=False)
 
-        pseudotime = _read_cached_dataframe(self.pseudotime_input_path())
-        selected_cells = self._selected_cell_names()
-        if selected_cells is None:
-            selected_pseudotime = pseudotime.copy()
-            self._pseudotime_view_cache = selected_pseudotime
-            return selected_pseudotime.copy(deep=False)
+        pseudotime = _read_cached_dataframe(self.pseudotime_input_path()).copy()
+        if pseudotime.shape[1] == 0:
+            raise ValueError(
+                "Pseudotime contains no trajectory columns. Convert a "
+                "one-value-per-row file to a cell-indexed PseudoTime column."
+            )
 
-        selected_set = set(selected_cells)
-        selected_rows = [
-            index for index in pseudotime.index if str(index) in selected_set
-        ]
-        selected_pseudotime = pseudotime.loc[selected_rows].copy()
+        pseudotime.index = pd.Index(
+            [str(value).strip() for value in pseudotime.index]
+        )
+        if pseudotime.index.has_duplicates:
+            raise ValueError("Pseudotime contains duplicate cell identifiers.")
+
+        numeric_pseudotime = pseudotime.apply(pd.to_numeric, errors="coerce")
+        invalid_values = pseudotime.notna() & numeric_pseudotime.isna()
+        if invalid_values.to_numpy().any():
+            raise ValueError(
+                "Pseudotime contains a non-numeric value outside blank/NA cells."
+            )
+        finite_values = numeric_pseudotime.to_numpy(dtype=float)
+        if np.isinf(finite_values).any():
+            raise ValueError("Pseudotime contains a non-finite value.")
+
+        selected_records = self._selected_cell_records()
+        expected_cells = [str(value) for value in self.read_expression_data().columns]
+        row_lookup = {str(index): index for index in numeric_pseudotime.index}
+        source_cells = (
+            [record['source'] for record in selected_records]
+            if selected_records is not None
+            else expected_cells
+        )
+        missing_cells = [cell for cell in source_cells if cell not in row_lookup]
+        if missing_cells:
+            raise ValueError(
+                f"Pseudotime is missing {len(missing_cells)} analyzed cells: "
+                f"{', '.join(missing_cells[:5])}."
+            )
+        if selected_records is None:
+            expected_set = set(expected_cells)
+            unknown_cells = [
+                str(index)
+                for index in numeric_pseudotime.index
+                if str(index) not in expected_set
+            ]
+            if unknown_cells:
+                raise ValueError(
+                    f"Pseudotime contains {len(unknown_cells)} unknown cells: "
+                    f"{', '.join(unknown_cells[:5])}."
+                )
+        selected_rows = [row_lookup[cell] for cell in source_cells]
+        selected_pseudotime = numeric_pseudotime.loc[selected_rows].copy()
+        selected_pseudotime.index = pd.Index(expected_cells)
+        selected_pseudotime = selected_pseudotime.dropna(
+            axis=1,
+            how="all",
+        )
+        if selected_pseudotime.shape[1] == 0:
+            raise ValueError(
+                "Pseudotime has no numeric trajectory values for the analyzed cells."
+            )
         self._pseudotime_view_cache = selected_pseudotime
         return selected_pseudotime.copy(deep=False)
 
@@ -582,3 +668,50 @@ class Runner(ABC):
             candidates[['Gene1', 'Gene2', 'EdgeWeight']],
             top_k,
         )
+
+    @staticmethod
+    def _merge_trajectory_edges(edge_streams) -> pd.DataFrame:
+        """Keep each edge's strongest trajectory score without losing its sign.
+
+        Trajectory-aware runners historically selected the largest edge
+        magnitude across trajectories. The magnitude determines which
+        observation wins, while the original signed value remains the emitted
+        ``EdgeWeight``.
+        """
+        best_by_edge = {}
+        sequence = 0
+        for edge_stream in edge_streams:
+            for source, target, raw_weight in edge_stream:
+                try:
+                    weight = float(raw_weight)
+                except (TypeError, ValueError):
+                    continue
+                if not isfinite(weight):
+                    continue
+
+                source = str(source)
+                target = str(target)
+                key = (source, target)
+                previous = best_by_edge.get(key)
+                if previous is None or abs(weight) > abs(previous[0]):
+                    best_by_edge[key] = (weight, sequence)
+                sequence += 1
+
+        rows = [
+            (source, target, weight, first_seen)
+            for (source, target), (weight, first_seen) in best_by_edge.items()
+        ]
+        if not rows:
+            return pd.DataFrame(columns=['Gene1', 'Gene2', 'EdgeWeight'])
+
+        merged = pd.DataFrame(
+            rows,
+            columns=['Gene1', 'Gene2', 'EdgeWeight', '_sequence'],
+        )
+        merged['_absolute_weight'] = merged['EdgeWeight'].abs()
+        merged = merged.sort_values(
+            ['_absolute_weight', '_sequence'],
+            ascending=[False, True],
+            kind='stable',
+        )
+        return merged[['Gene1', 'Gene2', 'EdgeWeight']].reset_index(drop=True)

@@ -70,7 +70,7 @@ The Dockerfile will run the GRNVBEM algorithm within the Docker container.
 
    - ``generateInputs()`` : This function reads the two input data files (i.e., expression data and the pseudotime), and processes them into the format required by the GRNVBEM. 
    - ``run()`` : This function constructs a "docker run" system command with parameters including the path of input data files (i.e., expression data and the pseudotime). It also specifies where the outputs are written. The docker container run GRNVBEM when the parameters are passed. 
-   - ``parseOutput()`` : This function reads the grnvbem-specific output (i.e., outFile.txt) and formats it into a ranked edgelist comma-separated file (i.e., rankedEdges.csv) with columns Gene1, Gene2, and EdgeWeight. The Gene1 column should contain regulators, the Gene2 column the targets, and EdgeWeight column the absolute value of the weight predicted for edge (regulator,target). The ranked edgelist file will be subsequently used by BLEval object. 
+   - ``parseOutput()`` : This function reads the GRNVBEM-specific output and formats it into a ranked edge list (``rankedEdges.csv``) with columns Gene1, Gene2, and EdgeWeight. Gene1 contains regulators, Gene2 contains targets, and EdgeWeight uses GRNVBEM's signed Score rather than its unsigned posterior Probability. Edges are ranked by absolute score magnitude while retaining activation/inhibition sign.
 
 6. **Add GRNVBEM to runner.py:** Next, update runner.py script in Beeline/BLRun folder by adding information related to GRNVBEM. 
 

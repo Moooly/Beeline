@@ -1,6 +1,4 @@
 import csv
-import heapq
-import os
 from pathlib import Path
 import shlex
 import pandas as pd
@@ -152,14 +150,26 @@ class SINCERITIESRunner(Runner):
             reader = csv.DictReader(handle)
             for row in reader:
                 try:
-                    interaction = abs(float(row['Interaction']))
+                    interaction = float(row['Interaction'])
                 except (KeyError, TypeError, ValueError):
                     continue
+                regulation_mode = str(row.get('Edges', '')).strip().casefold()
+                if regulation_mode == 'activation':
+                    signed_interaction = abs(interaction)
+                elif regulation_mode == 'repression':
+                    signed_interaction = -abs(interaction)
+                elif regulation_mode == 'no regulation':
+                    signed_interaction = 0.0
+                else:
+                    raise ValueError(
+                        "SINCERITIES output contains an unsupported regulatory "
+                        f"mode: {row.get('Edges')!r}."
+                    )
                 # Preserve the original SINCERITIES orientation correction.
                 yield (
                     row.get('TargetGENES', ''),
                     row.get('SourceGENES', ''),
-                    interaction,
+                    signed_interaction,
                 )
 
     def _parse_output_topk(self, out_path, top_k):
@@ -167,76 +177,25 @@ class SINCERITIESRunner(Runner):
         Stream a single trajectory's edge list, keeping only the top-K edges per
         target in a heap. SINCERITIES' output orientation is relabelled so that
         GRNScope's target (Gene2) is SINCERITIES' SourceGENES, matching the
-        column swap in the original full parse. Interaction is already absolute.
+        column swap in the original full parse. Ranking uses magnitude while the
+        emitted edge retains its activation/repression sign.
         '''
-        target_heaps: dict = {}
-        sequence = 0
-        with out_path.open('r', newline='') as handle:
-            reader = csv.reader(handle)
-            header = next(reader, None)
-            if header is None:
-                self._write_ranked_edges(
-                    pd.DataFrame(columns=['Gene1', 'Gene2', 'EdgeWeight'])
-                )
-                return
-            column = {name: index for index, name in enumerate(header)}
-            try:
-                source_col = column['SourceGENES']
-                target_col = column['TargetGENES']
-                interaction_col = column['Interaction']
-            except KeyError as exc:
-                raise ValueError(f"SINCERITIES output missing expected column: {exc}")
-
-            widest_column = max(source_col, target_col, interaction_col)
-            for row in reader:
-                if len(row) <= widest_column:
-                    continue
-                try:
-                    interaction = abs(float(row[interaction_col]))
-                except ValueError:
-                    continue
-                source_gene = row[source_col]
-                target_gene = row[target_col]
-                # GRNScope's target is SINCERITIES' SourceGENES (relabelled Gene2).
-                heap = target_heaps.setdefault(source_gene, [])
-                item = (interaction, sequence, source_gene, target_gene)
-                sequence += 1
-                if len(heap) < top_k:
-                    heapq.heappush(heap, item)
-                elif interaction > heap[0][0]:
-                    heapq.heapreplace(heap, item)
-
-        ranked_rows = []
-        for heap in target_heaps.values():
-            for interaction, _seq, source_gene, target_gene in sorted(
-                heap, key=lambda entry: (-entry[0], entry[1])
-            ):
-                # Relabel to GRNScope orientation: Gene1 = regulator (TargetGENES),
-                # Gene2 = target (SourceGENES).
-                ranked_rows.append((target_gene, source_gene, interaction))
-
         self._write_ranked_edges(
-            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
+            self._merge_bounded_trajectory_edges(
+                (self._iter_output_edges(out_path),),
+                top_k,
+            )
         )
 
     def _parse_output_full(self, workDir, colNames):
         '''
-        Original full parse: cross-trajectory max per edge, ranked descending,
-        with SINCERITIES' output columns relabelled to GRNScope orientation.
+        Keep the strongest trajectory magnitude for each edge while preserving
+        the activation/repression mode reported by SINCERITIES.
         '''
-        OutSubDF = [0]*len(colNames)
-        for idx in range(len(colNames)):
-            OutSubDF[idx] = pd.read_csv(workDir / ('outFile'+str(idx)+'.txt'), sep = ',', header = 0)
-
-        # megre the dataframe by taking the maximum value from each DF
-        # From here: https://stackoverflow.com/questions/20383647/pandas-selecting-by-label-sometimes-return-series-sometimes-returns-dataframe
-        outDF = pd.concat(OutSubDF)
-        # Group by rows code is from here:
-        # https://stackoverflow.com/questions/53114609/pandas-how-to-remove-duplicate-rows-but-keep-all-rows-with-max-value
-        res = outDF[outDF['Interaction'] == outDF.groupby(['SourceGENES','TargetGENES'])['Interaction'].transform('max')]
-        # Sort values in the dataframe
-        finalDF = res.sort_values('Interaction',ascending=False)
-        finalDF.drop(labels = 'Edges',axis = 'columns', inplace = True)
-        # SINCERITIES output is incorrectly orderd
-        finalDF.columns = ['Gene2','Gene1','EdgeWeight']
-        self._write_ranked_edges(finalDF[['Gene1', 'Gene2', 'EdgeWeight']])
+        merged = self._merge_trajectory_edges(
+            self._iter_output_edges(
+                workDir / ('outFile' + str(index) + '.txt')
+            )
+            for index in range(len(colNames))
+        )
+        self._write_ranked_edges(merged)

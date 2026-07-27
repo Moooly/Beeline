@@ -99,7 +99,7 @@ class Phase6OutputReductionTests(unittest.TestCase):
             source.write_text(
                 "Parent\tType\tChild\tWeight\tProbability\tScore\n"
                 "a\t+\ttarget\t0.2\t0.3\t0.1\n"
-                "b\t-\ttarget\t0.4\t0.9\t0.2\n"
+                "b\t-\ttarget\t-0.4\t0.9\t-0.8\n"
                 "c\t+\ttarget\t0.5\t0.7\t0.3\n",
                 encoding="utf-8",
             )
@@ -111,10 +111,10 @@ class Phase6OutputReductionTests(unittest.TestCase):
                         "-v", "input_header=1",
                         "-v", "source_col=1",
                         "-v", "target_col=3",
-                        "-v", "score_col=5",
+                        "-v", "score_col=6",
                         "-v", "output_source=Parent",
                         "-v", "output_target=Child",
-                        "-v", "output_score=Probability",
+                        "-v", "output_score=Score",
                         "-F", "\t",
                         "-f", str(script),
                         str(source),
@@ -126,7 +126,7 @@ class Phase6OutputReductionTests(unittest.TestCase):
 
         self.assertEqual(list(bounded.Parent), ["b", "c"])
         self.assertEqual(list(bounded.Child), ["target", "target"])
-        self.assertEqual(list(bounded.Probability), [0.9, 0.7])
+        self.assertEqual(list(bounded.Score), [-0.8, 0.3])
 
     def test_bounded_trajectory_merge_matches_full_global_top_k(self):
         trajectories = [
@@ -137,6 +137,19 @@ class Phase6OutputReductionTests(unittest.TestCase):
 
         self.assertEqual(set(bounded.Gene1), {"a", "c"})
         self.assertEqual(dict(zip(bounded.Gene1, bounded.EdgeWeight)), {"a": 9.0, "c": 10.0})
+
+    def test_full_trajectory_merge_ranks_by_magnitude_and_retains_sign(self):
+        trajectories = [
+            iter([("a", "x", -9), ("b", "x", 8)]),
+            iter([("a", "x", 2), ("b", "x", -10)]),
+        ]
+        merged = Runner._merge_trajectory_edges(trajectories)
+
+        self.assertEqual(list(merged.Gene1), ["b", "a"])
+        self.assertEqual(
+            dict(zip(merged.Gene1, merged.EdgeWeight)),
+            {"a": -9.0, "b": -10.0},
+        )
 
 
 if __name__ == "__main__":

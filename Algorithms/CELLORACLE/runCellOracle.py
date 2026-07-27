@@ -6,7 +6,7 @@ upstream by GRNScope, which passes one cluster's cells at a time), and writes a
 ranked directed/signed edge list.
 
 Pipeline (CellOracle standard):
-  expression -> AnnData -> Oracle.import_anndata_as_raw_count
+  expression -> AnnData -> state-aware CellOracle import
   -> import_TF_data(base GRN)
   -> perform_PCA + knn_imputation -> get_links -> filter by p-value -> edge list
 
@@ -98,6 +98,16 @@ def parse_args(argv):
     parser.add_argument("--topK", type=int, default=0, help="max regulators per target (0 = keep all)")
     parser.add_argument("--maxGenes", type=int, default=0, help="cap to top-variance genes (0 = no cap)")
     parser.add_argument("--maxCells", type=int, default=0, help="subsample cells (0 = no cap)")
+    parser.add_argument(
+        "--expressionMode",
+        choices=("raw_count", "normalized_log"),
+        default="raw_count",
+        help=(
+            "raw_count lets CellOracle apply log1p once; normalized_log "
+            "imports already log-transformed values unchanged"
+        ),
+    )
+    parser.add_argument("--inputContractVersion", type=int, default=1)
     parser.add_argument("--nJobs", type=int, default=max(1, os.cpu_count() or 1))
     return parser.parse_args(argv)
 
@@ -197,6 +207,50 @@ def preprocess_for_celloracle(adata: ad.AnnData):
     return adata, n_comps, "X_grnscope"
 
 
+def import_expression_into_oracle(
+    oracle,
+    adata: ad.AnnData,
+    *,
+    expression_mode: str,
+    cluster_column_name: str,
+    embedding_name: str,
+) -> None:
+    values = np.asarray(adata.X)
+    if not np.isfinite(values).all():
+        raise ValueError("CellOracle expression input contains non-finite values.")
+    if (values < 0).any():
+        raise ValueError(
+            "CellOracle expression input must be non-negative and uncentered."
+        )
+
+    if expression_mode == "raw_count":
+        oracle.import_anndata_as_raw_count(
+            adata=adata,
+            cluster_column_name=cluster_column_name,
+            embedding_name=embedding_name,
+        )
+        return
+    if expression_mode != "normalized_log":
+        raise ValueError(f"Unsupported CellOracle expression mode: {expression_mode}.")
+
+    # CellOracle 0.20 uses a raw_count layer only for its CV-vs-mean QC when
+    # importing normalized data. Reconstructing that layer satisfies the
+    # importer's QC contract while adata.X—and therefore normalized_count used
+    # by inference—remains exactly the supplied log-scale matrix.
+    maximum_log_value = np.log(np.finfo(np.float64).max)
+    if values.size and float(values.max()) > maximum_log_value:
+        raise ValueError(
+            "CellOracle log-normalized input is too large to reconstruct its "
+            "QC count layer."
+        )
+    adata.layers["raw_count"] = np.expm1(values.astype(np.float64, copy=False))
+    oracle.import_anndata_as_normalized_count(
+        adata=adata,
+        cluster_column_name=cluster_column_name,
+        embedding_name=embedding_name,
+    )
+
+
 def infer_links(
     adata: ad.AnnData,
     tf_dictionary: dict,
@@ -204,10 +258,13 @@ def infer_links(
     embedding_name: str,
     alpha: float,
     n_jobs: int,
+    expression_mode: str,
 ):
     oracle = co.Oracle()
-    oracle.import_anndata_as_raw_count(
-        adata=adata,
+    import_expression_into_oracle(
+        oracle,
+        adata,
+        expression_mode=expression_mode,
         cluster_column_name=GRN_UNIT_COLUMN,
         embedding_name=embedding_name,
     )
@@ -276,6 +333,7 @@ def execute_inference(args):
         embedding_name,
         args.alpha,
         args.nJobs,
+        args.expressionMode,
     )
     ranked = extract_edges(links, args.pValueCutoff, args.topK)
 
@@ -284,7 +342,13 @@ def execute_inference(args):
     return {
         "edge_count": int(len(ranked)),
         "prior_cache_hit": prior_cache_hit,
-        "preprocessing_mode": "oracle_native_with_metadata_embedding",
+        "expression_mode": args.expressionMode,
+        "input_contract_version": args.inputContractVersion,
+        "preprocessing_mode": (
+            "raw_count_celloracle_log1p"
+            if args.expressionMode == "raw_count"
+            else "normalized_log_imported_without_transform"
+        ),
     }
 
 

@@ -129,19 +129,25 @@ class SCODERunner(Runner):
         Keep only the top-K regulators per target (matrix column) by absolute
         weight, using np.argpartition so the full g^2 matrix is never sorted.
         '''
-        OutMatrix = np.abs(pd.read_csv(meanA_path, sep='\t', header=None).values)
+        OutMatrix = pd.read_csv(meanA_path, sep='\t', header=None).values
         n_rows, n_cols = OutMatrix.shape
         keep = min(top_k, n_rows)
 
         ranked_rows = []
         for col in range(n_cols):
             column = OutMatrix[:, col]
+            absolute_column = np.abs(column)
             if keep < n_rows:
-                candidate_rows = np.argpartition(column, n_rows - keep)[n_rows - keep:]
+                candidate_rows = np.argpartition(
+                    absolute_column,
+                    n_rows - keep,
+                )[n_rows - keep:]
             else:
                 candidate_rows = np.arange(n_rows)
             # Order the kept regulators by descending absolute weight.
-            candidate_rows = candidate_rows[np.argsort(column[candidate_rows])[::-1]]
+            candidate_rows = candidate_rows[
+                np.argsort(absolute_column[candidate_rows])[::-1]
+            ]
             target = GeneList[col]
             for row in candidate_rows:
                 ranked_rows.append((GeneList[row], target, column[row]))
@@ -152,34 +158,27 @@ class SCODERunner(Runner):
 
     def _parse_output_full(self, workDir, colNames, GeneList):
         '''
-        Original full parse: sort every entry of each trajectory's A matrix,
-        take the cross-trajectory max per edge, and rank descending.
+        Preserve SCODE's signed A-matrix coefficients and keep the coefficient
+        with the largest absolute magnitude across trajectories.
         '''
-        for indx in range(len(colNames)):
-            OutDF = pd.read_csv(workDir / (str(indx)+'/meanA.txt'), sep = '\t', header = None)
+        def matrix_edges(mean_a_path):
+            matrix = pd.read_csv(
+                mean_a_path,
+                sep='\t',
+                header=None,
+            ).values
+            if matrix.shape != (len(GeneList), len(GeneList)):
+                raise ValueError(
+                    "SCODE output matrix shape does not match the expression "
+                    f"gene count: {matrix.shape} versus "
+                    f"({len(GeneList)}, {len(GeneList)})."
+                )
+            for row in range(matrix.shape[0]):
+                for col in range(matrix.shape[1]):
+                    yield GeneList[row], GeneList[col], matrix[row, col]
 
-            # Sort values in a matrix using code from:
-            # https://stackoverflow.com/questions/21922806/sort-values-of-matrix-in-python
-            OutMatrix = np.abs(OutDF.values)
-            idx = np.argsort(OutMatrix, axis = None)[::-1]
-            rows, cols = np.unravel_index(idx, OutDF.shape)
-            DFSorted = OutMatrix[rows, cols]
-
-            outFile = open(workDir / ('outFile'+str(indx)+'.csv'),'w')
-            outFile.write('Gene1'+'\t'+'Gene2'+'\t'+'EdgeWeight'+'\n')
-
-            for row, col, val in zip(rows, cols, DFSorted):
-                outFile.write('\t'.join([GeneList[row],GeneList[col],str(val)])+'\n')
-            outFile.close()
-
-        OutSubDF = [0]*len(colNames)
-        for indx in range(len(colNames)):
-            outFile = 'outFile'+str(indx)+'.csv'
-            OutSubDF[indx] = pd.read_csv(workDir / outFile, sep = '\t', header = 0)
-
-            OutSubDF[indx].EdgeWeight = np.abs(OutSubDF[indx].EdgeWeight)
-
-        outDF = pd.concat(OutSubDF)
-        FinalDF = outDF[outDF['EdgeWeight'] == outDF.groupby(['Gene1','Gene2'])['EdgeWeight'].transform('max')]
-        FinalDF = FinalDF.sort_values(['EdgeWeight'], ascending=False)
-        self._write_ranked_edges(FinalDF[['Gene1', 'Gene2', 'EdgeWeight']])
+        merged = self._merge_trajectory_edges(
+            matrix_edges(workDir / (str(index) + '/meanA.txt'))
+            for index in range(len(colNames))
+        )
+        self._write_ranked_edges(merged)

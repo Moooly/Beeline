@@ -12,33 +12,102 @@ from BLRun.runner import Runner
 class PPCORRunner(Runner):
     """Concrete runner for the PPCOR GRN inference algorithm."""
 
+    DEFAULT_MAX_GENES = 500
+    MINIMUM_GENES = 3
+
     def generateInputs(self):
         '''
         Make the expression matrix available to PPCOR inside working_dir.
 
-        PPCOR consumes the matrix in exactly the comma-separated genes x cells
-        layout it is provided in, so no reformatting is needed. The file is
-        hard-linked into working_dir (falling back to a copy across
-        filesystems) instead of being read into pandas and rewritten verbatim,
-        which avoids a redundant full read+write of the matrix on every run.
+        PPCOR needs fewer genes than cells to provide the p-values GRNScope uses
+        for edge filtering. Apply its mandatory configured/cell-count limit
+        before the R process starts. Small already-safe matrices are hard-linked
+        into working_dir (falling back to a copy across filesystems).
         '''
         source_file = self.input_dir / self.exprData
         PPCOR_EXPRESSION_FILE = self.working_dir / "ExpressionData.csv"
         if PPCOR_EXPRESSION_FILE.exists():
             return
+        max_genes = self._resolve_max_genes()
         if (
             getattr(self, 'expression_source', None) is not None
             or getattr(self, 'selected_cells_file', None) is not None
         ):
-            self.read_expression_data().to_csv(PPCOR_EXPRESSION_FILE)
+            expression = self.read_expression_data()
+            self._limit_expression_genes(expression, max_genes).to_csv(
+                PPCOR_EXPRESSION_FILE
+            )
             return
         if not source_file.exists():
             raise FileNotFoundError(
                 f"Expression data file not found: {source_file}")
+
+        gene_count, cell_count = self._expression_shape(source_file)
+        effective_max_genes = self._effective_max_genes(
+            configured_max_genes=max_genes,
+            cell_count=cell_count,
+        )
+        if gene_count > effective_max_genes:
+            expression = self.read_expression_data()
+            self._limit_expression_genes(expression, max_genes).to_csv(
+                PPCOR_EXPRESSION_FILE
+            )
+            return
         try:
             os.link(source_file, PPCOR_EXPRESSION_FILE)
         except OSError:
             shutil.copy2(source_file, PPCOR_EXPRESSION_FILE)
+
+    def _resolve_max_genes(self):
+        raw = self.params.get('maxGenes', self.DEFAULT_MAX_GENES)
+        try:
+            max_genes = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("PPCOR maxGenes must be an integer.") from exc
+        if max_genes < self.MINIMUM_GENES:
+            raise ValueError(
+                f"PPCOR maxGenes must be at least {self.MINIMUM_GENES}."
+            )
+        return max_genes
+
+    @staticmethod
+    def _expression_shape(source_file):
+        with source_file.open('r', encoding='utf-8', newline='') as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            if not header:
+                raise ValueError("PPCOR expression data is empty.")
+            cell_count = max(0, len(header) - 1)
+            gene_count = sum(
+                1
+                for row in reader
+                if row and any(str(value).strip() for value in row)
+            )
+        return gene_count, cell_count
+
+    def _effective_max_genes(self, *, configured_max_genes, cell_count):
+        cell_limited_max_genes = int(cell_count) - 1
+        if cell_limited_max_genes < self.MINIMUM_GENES:
+            raise ValueError(
+                "PPCOR requires at least 4 cells so it can analyze at least "
+                "3 genes with valid partial-correlation p-values."
+            )
+        return min(int(configured_max_genes), cell_limited_max_genes)
+
+    def _limit_expression_genes(self, expression, configured_max_genes):
+        effective_max_genes = self._effective_max_genes(
+            configured_max_genes=configured_max_genes,
+            cell_count=len(expression.columns),
+        )
+        if len(expression.index) <= effective_max_genes:
+            return expression
+        variances = expression.var(axis=1, ddof=0)
+        retained_genes = (
+            variances.sort_values(ascending=False, kind='mergesort')
+            .head(effective_max_genes)
+            .index
+        )
+        return expression.loc[retained_genes]
 
     def run(self):
         '''

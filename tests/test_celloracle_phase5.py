@@ -29,6 +29,8 @@ class FakeDockerWorker:
             "worker_pid": 42,
             "request_index": 2,
             "prior_cache_hit": True,
+            "expression_mode": "normalized_log",
+            "input_contract_version": 2,
             "preprocessing_mode": "oracle_native_with_metadata_embedding",
             "elapsed_seconds": 1.25,
             "edge_count": 11,
@@ -61,6 +63,8 @@ class CellOraclePhase5Tests(unittest.TestCase):
             "topK": 5,
             "maxGenes": 2000,
             "maxCells": 300,
+            "expressionMode": "normalized_log",
+            "inputContractVersion": 2,
         }
         runner.cpu_budget = 3
         runner.memory_budget_mb = 6000
@@ -123,6 +127,8 @@ class CellOraclePhase5Tests(unittest.TestCase):
                     "worker_pid": 42,
                     "request_index": 2,
                     "prior_cache_hit": True,
+                    "expression_mode": "normalized_log",
+                    "input_contract_version": 2,
                     "preprocessing_mode": "oracle_native_with_metadata_embedding",
                     "worker_elapsed_seconds": 1.25,
                     "edge_count": 11,
@@ -145,6 +151,8 @@ class CellOraclePhase5Tests(unittest.TestCase):
         self.assertIn("--topK 5", joined)
         self.assertIn("--maxGenes 2000", joined)
         self.assertIn("--maxCells 300", joined)
+        self.assertIn("--expressionMode normalized_log", joined)
+        self.assertIn("--inputContractVersion 2", joined)
         self.assertIn("--nJobs 3", joined)
 
     def test_expression_input_is_published_atomically(self):
@@ -304,6 +312,100 @@ class CellOraclePhase5Tests(unittest.TestCase):
                 )
             )
             self.assertEqual(score["score"], expected_score)
+
+    def test_network_import_keeps_normalized_log_values_unchanged(self):
+        module = self.load_in_container_script()
+        values = np.asarray([[0.0, np.log1p(3.0)]], dtype=np.float32)
+        adata = types.SimpleNamespace(X=values.copy(), layers={})
+        calls = []
+        oracle = types.SimpleNamespace(
+            import_anndata_as_raw_count=lambda **kwargs: calls.append(("raw", kwargs)),
+            import_anndata_as_normalized_count=lambda **kwargs: calls.append(
+                ("normalized", kwargs)
+            ),
+        )
+
+        module.import_expression_into_oracle(
+            oracle,
+            adata,
+            expression_mode="normalized_log",
+            cluster_column_name="cluster",
+            embedding_name="X_test",
+        )
+
+        self.assertEqual(calls[0][0], "normalized")
+        np.testing.assert_array_equal(adata.X, values)
+        np.testing.assert_allclose(adata.layers["raw_count"], [[0.0, 3.0]])
+
+    def test_network_raw_import_delegates_the_single_log_transform_to_celloracle(self):
+        module = self.load_in_container_script()
+        values = np.asarray([[0.0, 3.0]], dtype=np.float32)
+        adata = types.SimpleNamespace(X=values.copy(), layers={})
+        calls = []
+        oracle = types.SimpleNamespace(
+            import_anndata_as_raw_count=lambda **kwargs: calls.append(("raw", kwargs)),
+            import_anndata_as_normalized_count=lambda **kwargs: calls.append(
+                ("normalized", kwargs)
+            ),
+        )
+
+        module.import_expression_into_oracle(
+            oracle,
+            adata,
+            expression_mode="raw_count",
+            cluster_column_name="cluster",
+            embedding_name="X_test",
+        )
+
+        self.assertEqual([call[0] for call in calls], ["raw"])
+        np.testing.assert_array_equal(adata.X, values)
+
+    def test_perturbation_import_uses_the_same_normalized_contract(self):
+        module = self.load_perturbation_script()
+        values = np.asarray([[np.log1p(2.0), np.log1p(5.0)]], dtype=np.float32)
+        adata = types.SimpleNamespace(X=values.copy(), layers={})
+        calls = []
+        oracle = types.SimpleNamespace(
+            import_anndata_as_raw_count=lambda **kwargs: calls.append(("raw", kwargs)),
+            import_anndata_as_normalized_count=lambda **kwargs: calls.append(
+                ("normalized", kwargs)
+            ),
+        )
+
+        module.import_expression_into_oracle(
+            oracle,
+            adata,
+            expression_mode="normalized_log",
+            cluster_column_name="cluster",
+            embedding_name="X_umap",
+        )
+
+        self.assertEqual([call[0] for call in calls], ["normalized"])
+        np.testing.assert_array_equal(adata.X, values)
+        np.testing.assert_allclose(
+            adata.layers["raw_count"],
+            [[2.0, 5.0]],
+            rtol=1e-6,
+        )
+
+    def test_perturbation_embedding_does_not_retransform_normalized_log_input(self):
+        module = self.load_perturbation_script()
+        values = np.asarray([[0.0, np.log1p(4.0)]], dtype=np.float32)
+        adata = types.SimpleNamespace(X=values.copy(), raw=None)
+        calls = []
+        module.sc.pp = types.SimpleNamespace(
+            normalize_total=lambda *_args, **_kwargs: calls.append("normalize_total"),
+            log1p=lambda *_args, **_kwargs: calls.append("log1p"),
+            scale=lambda *_args, **_kwargs: calls.append("scale"),
+        )
+
+        model_input = module.prepare_embedding_expression(
+            adata,
+            "normalized_log",
+        )
+
+        self.assertEqual(calls, ["scale"])
+        np.testing.assert_array_equal(model_input, values)
 
     def test_container_waits_for_delayed_bind_mount_contents(self):
         module = self.load_in_container_script()

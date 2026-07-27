@@ -285,6 +285,8 @@ class CellOracleRunner(Runner):
             "worker_pid": response.get("worker_pid"),
             "request_index": response.get("request_index"),
             "prior_cache_hit": response.get("prior_cache_hit"),
+            "expression_mode": response.get("expression_mode"),
+            "input_contract_version": response.get("input_contract_version"),
             "preprocessing_mode": response.get("preprocessing_mode"),
             "worker_elapsed_seconds": response.get("elapsed_seconds"),
             "edge_count": response.get("edge_count"),
@@ -312,6 +314,12 @@ class CellOracleRunner(Runner):
             '--topK', str(effective_top_k),
             '--maxGenes', str(self.params.get('maxGenes', 0)),
             '--maxCells', str(self.params.get('maxCells', 0)),
+            '--expressionMode', str(
+                self.params.get('expressionMode', 'raw_count')
+            ),
+            '--inputContractVersion', str(
+                self.params.get('inputContractVersion', 1)
+            ),
             '--nJobs', str(getattr(self, 'cpu_budget', 1)),
         ]
 

@@ -41,6 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-propagation", type=int, default=3)
     parser.add_argument("--alpha", type=float, default=10.0)
     parser.add_argument("--max-cells", type=int, default=2000)
+    parser.add_argument(
+        "--expression-mode",
+        choices=("raw_count", "normalized_log"),
+        default="raw_count",
+    )
     parser.add_argument("--clip-delta-x", action="store_true")
     parser.add_argument("--n-jobs", type=int, default=max(1, os.cpu_count() or 1))
     return parser.parse_args()
@@ -180,6 +185,63 @@ def build_anndata(
     return adata
 
 
+def import_expression_into_oracle(
+    oracle,
+    adata: ad.AnnData,
+    *,
+    expression_mode: str,
+    cluster_column_name: str,
+    embedding_name: str,
+) -> None:
+    values = np.asarray(adata.X)
+    if expression_mode == "raw_count":
+        oracle.import_anndata_as_raw_count(
+            adata=adata,
+            cluster_column_name=cluster_column_name,
+            embedding_name=embedding_name,
+        )
+        return
+    if expression_mode != "normalized_log":
+        raise ValueError(f"Unsupported CellOracle expression mode: {expression_mode}.")
+
+    maximum_log_value = np.log(np.finfo(np.float64).max)
+    if values.size and float(values.max()) > maximum_log_value:
+        raise ValueError(
+            "CellOracle log-normalized input is too large to reconstruct its "
+            "QC count layer."
+        )
+    adata.layers["raw_count"] = np.expm1(values.astype(np.float64, copy=False))
+    oracle.import_anndata_as_normalized_count(
+        adata=adata,
+        cluster_column_name=cluster_column_name,
+        embedding_name=embedding_name,
+    )
+
+
+def prepare_embedding_expression(
+    adata: ad.AnnData,
+    expression_mode: str,
+) -> np.ndarray:
+    """Prepare only the temporary expression values used for the UMAP."""
+    model_input = adata.X.copy()
+    values = np.asarray(model_input)
+    if not np.isfinite(values).all():
+        raise ValueError("CellOracle expression input contains non-finite values.")
+    if (values < 0).any():
+        raise ValueError(
+            "CellOracle expression input must be non-negative and uncentered."
+        )
+
+    if expression_mode == "raw_count":
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+    elif expression_mode != "normalized_log":
+        raise ValueError(f"Unsupported CellOracle expression mode: {expression_mode}.")
+    adata.raw = adata
+    sc.pp.scale(adata)
+    return model_input
+
+
 def prepare_oracle(
     expression_path: Path,
     edges_path: Path,
@@ -189,6 +251,7 @@ def prepare_oracle(
     alpha: float,
     max_cells: int,
     n_jobs: int,
+    expression_mode: str,
 ):
     expression = read_table(expression_path, index_col=0)
     if expression.empty:
@@ -200,11 +263,9 @@ def prepare_oracle(
     labels = read_cluster_labels(clusters_path)
     adata = build_anndata(expression, labels, max_cells)
 
-    adata.layers["raw_count"] = adata.X.copy()
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-    adata.raw = adata
-    sc.pp.scale(adata)
+    # Build an embedding on a log scale without changing the values later
+    # imported for GRN fitting and perturbation simulation.
+    model_input = prepare_embedding_expression(adata, expression_mode)
 
     n_comps = max(2, int(min(50, adata.n_obs - 1, adata.n_vars - 1)))
     sc.tl.pca(adata, n_comps=n_comps, svd_solver="arpack")
@@ -214,15 +275,17 @@ def prepare_oracle(
         n_pcs=n_comps,
     )
     sc.tl.umap(adata, random_state=0)
-    adata.X = adata.layers["raw_count"].copy()
+    adata.X = model_input
 
     use_cluster_grn = bool(int(adata.uns.get("grnscope_cluster_labels_matched", 0)))
     grn_unit = "cluster" if use_cluster_grn else "whole"
     cluster_column = CLUSTER_COLUMN if use_cluster_grn else GRN_UNIT_COLUMN
 
     oracle = co.Oracle()
-    oracle.import_anndata_as_raw_count(
-        adata=adata,
+    import_expression_into_oracle(
+        oracle,
+        adata,
+        expression_mode=expression_mode,
         cluster_column_name=cluster_column,
         embedding_name="X_umap",
     )
@@ -268,6 +331,7 @@ def prepare_oracle(
     )
     oracle.adata.uns["grnscope_cluster_topology_labels"] = sorted(cluster_topology_labels)
     oracle.adata.uns["grnscope_fallback_topology_labels"] = sorted(fallback_topology_labels)
+    oracle.adata.uns["grnscope_expression_mode"] = expression_mode
     model_path.parent.mkdir(parents=True, exist_ok=True)
     oracle.to_hdf5(str(model_path))
     return oracle
@@ -864,6 +928,9 @@ def build_result(oracle, args: argparse.Namespace, model_reused: bool) -> dict:
         "clip_delta_x": bool(args.clip_delta_x),
         "celloracle_version": str(co.__version__),
         "model_reused": model_reused,
+        "expression_mode": str(
+            oracle.adata.uns.get("grnscope_expression_mode", args.expression_mode)
+        ),
         "model_scope": "cluster_specific" if grn_unit == "cluster" else "global",
         "grn_unit": grn_unit,
         "cluster_count": int(oracle.adata.uns.get("grnscope_cluster_count", 0)),
@@ -953,6 +1020,7 @@ def main() -> None:
             args.alpha,
             args.max_cells,
             args.n_jobs,
+            args.expression_mode,
         )
 
     if args.gene not in oracle.adata.var_names:

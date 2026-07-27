@@ -1,6 +1,4 @@
 import csv
-import heapq
-import os
 from pathlib import Path
 import shlex
 import pandas as pd
@@ -86,9 +84,9 @@ class GRNVBEMRunner(Runner):
             compact_command = (
                 " && awk"
                 f" -v top_k={top_k} -v input_header=1"
-                " -v source_col=1 -v target_col=3 -v score_col=5"
+                " -v source_col=1 -v target_col=3 -v score_col=6"
                 " -v output_source=Parent -v output_target=Child"
-                " -v output_score=Probability -F '\\t'"
+                " -v output_score=Score -F '\\t'"
                 f" -f /compactEdgeList.awk {algorithm_output_path} > {output_path}"
                 if top_k
                 else ""
@@ -159,87 +157,66 @@ class GRNVBEMRunner(Runner):
     @staticmethod
     def _iter_output_edges(out_path):
         with out_path.open('r', newline='') as handle:
-            reader = csv.DictReader(handle, delimiter='\t')
+            reader = csv.reader(handle, delimiter='\t')
+            header = next(reader, None)
+            if not header:
+                return
+
+            # The bundled GRNVBEM binary writes a space-delimited header above
+            # tab-delimited six-column rows. The bounded compactor writes a
+            # conventional three-column tab-delimited header instead.
+            if 'Score' in header:
+                parent_col = header.index('Parent')
+                child_col = header.index('Child')
+                score_col = header.index('Score')
+            elif header[0].split() == [
+                'Parent', '-', 'Child', 'Weight', 'Probability', 'Score'
+            ]:
+                parent_col, child_col, score_col = 0, 2, 5
+            else:
+                raise ValueError(
+                    "GRNVBEM output header does not expose Parent, Child, and "
+                    f"Score columns: {header!r}."
+                )
+
+            widest_column = max(parent_col, child_col, score_col)
             for row in reader:
+                if len(row) <= widest_column:
+                    continue
                 try:
-                    probability = float(row['Probability'])
-                except (KeyError, TypeError, ValueError):
+                    score = float(row[score_col])
+                except (TypeError, ValueError):
                     continue
                 yield (
-                    row.get('Parent', ''),
-                    row.get('Child', ''),
-                    probability,
+                    row[parent_col],
+                    row[child_col],
+                    score,
                 )
 
     def _parse_output_topk(self, out_path, top_k):
         '''
         Stream a single trajectory's edge list, keeping only the top-K edges per
-        target (Child) by probability in a heap. GRNScope's target is the Child
+        target (Child) by signed-score magnitude. GRNScope's target is the Child
         gene; the emitted orientation matches the original column rename
-        (Parent -> Gene1, Child -> Gene2, Probability -> EdgeWeight).
+        (Parent -> Gene1, Child -> Gene2, Score -> EdgeWeight).
         '''
-        target_heaps: dict = {}
-        sequence = 0
-        with out_path.open('r', newline='') as handle:
-            reader = csv.reader(handle, delimiter='\t')
-            header = next(reader, None)
-            if header is None:
-                self._write_ranked_edges(
-                    pd.DataFrame(columns=['Gene1', 'Gene2', 'EdgeWeight'])
-                )
-                return
-            column = {name: index for index, name in enumerate(header)}
-            try:
-                parent_col = column['Parent']
-                child_col = column['Child']
-                probability_col = column['Probability']
-            except KeyError as exc:
-                raise ValueError(f"GRNVBEM output missing expected column: {exc}")
-
-            widest_column = max(parent_col, child_col, probability_col)
-            for row in reader:
-                if len(row) <= widest_column:
-                    continue
-                try:
-                    probability = float(row[probability_col])
-                except ValueError:
-                    continue
-                parent = row[parent_col]
-                child = row[child_col]
-                # GRNScope's target is the Child gene; keep its strongest parents.
-                heap = target_heaps.setdefault(child, [])
-                item = (abs(probability), sequence, parent, child, probability)
-                sequence += 1
-                if len(heap) < top_k:
-                    heapq.heappush(heap, item)
-                elif abs(probability) > heap[0][0]:
-                    heapq.heapreplace(heap, item)
-
-        ranked_rows = []
-        for heap in target_heaps.values():
-            for _abs_probability, _seq, parent, child, probability in sorted(
-                heap, key=lambda entry: (-entry[0], entry[1])
-            ):
-                ranked_rows.append((parent, child, probability))
-
         self._write_ranked_edges(
-            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
+            self._merge_bounded_trajectory_edges(
+                (self._iter_output_edges(out_path),),
+                top_k,
+            )
         )
 
     def _parse_output_full(self, workDir, colNames):
         '''
-        Original full parse: cross-trajectory max per edge, ranked descending,
-        with GRNVBEM's columns renamed to GRNScope orientation.
+        Use GRNVBEM's signed Score rather than its unsigned posterior
+        Probability, retaining the strongest score magnitude across
+        trajectories.
         '''
-        OutSubDF = [0]*len(colNames)
-        for indx in range(len(colNames)):
-            OutSubDF[indx] = pd.read_csv(workDir / ('outFile'+str(indx)+'.txt'), sep = '\t', header = 0)
-
-        outDF = pd.concat(OutSubDF)
-        FinalDF = outDF[outDF['Probability'] == outDF.groupby(['Parent','Child'])['Probability'].transform('max')]
-
-        self._write_ranked_edges(
-            FinalDF.sort_values('Probability', ascending=False).rename(
-                columns={'Parent': 'Gene1', 'Child': 'Gene2', 'Probability': 'EdgeWeight'}
-            )[['Gene1', 'Gene2', 'EdgeWeight']]
+        merged = self._merge_trajectory_edges(
+            self._iter_output_edges(
+                workDir / ('outFile' + str(index) + '.txt')
+            )
+            for index in range(len(colNames))
         )
+        self._write_ranked_edges(merged)

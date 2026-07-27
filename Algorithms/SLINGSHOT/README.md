@@ -5,8 +5,9 @@ single-cell expression matrix, so datasets uploaded **without** a `PseudoTime.cs
 can still run the trajectory-based GRN methods (SCODE, SINCERITIES, SCRIBE,
 SINGE, LEAP, GRISLI, GRNVBEM).
 
-It mirrors BEELINE's preprocessing pipeline: **log-transform → PCA → cluster →
-Slingshot**, and writes a BEELINE-compatible `PseudoTime.csv`. Unlike the other
+It follows a declared matrix-state contract: **state-aware expression
+preparation → PCA → cluster → Slingshot**, and writes a BEELINE-compatible
+`PseudoTime.csv`. Unlike the other
 `Algorithms/` folders (which run GRN inference), this is a **preprocessing /
 trajectory-inference** tool that *produces* an input the GRN methods consume.
 
@@ -22,6 +23,7 @@ Rscript estimate_pseudotime.R \
   --expression ExpressionData.csv \   # required
   [--clusters ClusterLabels.csv] \    # optional
   [--startCluster <label>] \          # optional trajectory root
+  [--matrixState raw|normalized|log_normalized] \
   [--nPCs 20] \                       # optional, PCA components
   [--nClusters 10] \                  # optional, k for k-means when no clusters
   [--seed 1] \                        # optional
@@ -33,6 +35,7 @@ Rscript estimate_pseudotime.R \
 | `-e`, `--expression` | yes | — | `ExpressionData.csv`, genes × cells (first column = gene names, header = cell names). |
 | `-c`, `--clusters` | no | — | `ClusterLabels.csv`: cell name in the first column, cluster label in the next. If omitted, cells are clustered by k-means on the PCA embedding. |
 | `-s`, `--startCluster` | no | auto | Cluster label to use as the trajectory root. If omitted, Slingshot picks the root (direction is then arbitrary — prefer setting this). |
+| `--matrixState` | no | `raw` | Declares the input scale. Raw values are normalized to 10,000 counts per cell and log1p transformed; normalized values receive log1p once; log-normalized values remain unchanged. |
 | `--nPCs` | no | 20 | Principal components used for the embedding (clamped to the data size). |
 | `--nClusters` | no | 10 | k for k-means, used only when `--clusters` is not given. |
 | `--seed` | no | 1 | Random seed (affects k-means; keeps runs reproducible). |

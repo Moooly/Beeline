@@ -270,9 +270,10 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         self.assertIn("/tmp/grnvbem-full.txt", grnvbem_commands[0][0])
         self.assertIn("compactEdgeList.awk", grnvbem_commands[0][0])
         self.assertIn(
-            "source_col=1 -v target_col=3 -v score_col=5",
+            "source_col=1 -v target_col=3 -v score_col=6",
             grnvbem_commands[0][0],
         )
+        self.assertIn("output_score=Score", grnvbem_commands[0][0])
 
         ppcor, ppcor_commands = self.make_runner(
             PPCORRunner,
@@ -336,6 +337,58 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         generated = pd.read_csv(self.working_dir / "ExpressionData0.csv")
         self.assertEqual(list(generated["GENES"]), ["gene-e", "gene-c", "gene-b"])
 
+    def test_ppcor_applies_mandatory_gene_and_cell_count_safeguards(self):
+        runner, _commands = self.make_runner(
+            PPCORRunner,
+            {"maxGenes": 500, "pVal": 0.05},
+        )
+        pd.DataFrame(
+            {
+                "cell-0": [0, 0, 0, 1, 0],
+                "cell-1": [0, 1, 2, 1, 3],
+                "cell-2": [0, 2, 4, 1, 6],
+                "cell-3": [0, 3, 6, 1, 9],
+            },
+            index=["gene-a", "gene-b", "gene-c", "gene-d", "gene-e"],
+        ).to_csv(self.input_dir / "ExpressionData.csv")
+
+        runner.generateInputs()
+
+        generated = pd.read_csv(
+            self.working_dir / "ExpressionData.csv",
+            index_col=0,
+        )
+        self.assertEqual(list(generated.index), ["gene-e", "gene-c", "gene-b"])
+        self.assertLess(len(generated.index), len(generated.columns))
+
+    def test_ppcor_rejects_too_few_cells_before_running(self):
+        runner, _commands = self.make_runner(
+            PPCORRunner,
+            {"maxGenes": 500, "pVal": 0.05},
+        )
+        pd.DataFrame(
+            {
+                "cell-0": [0, 1, 2, 3],
+                "cell-1": [1, 2, 3, 4],
+                "cell-2": [2, 3, 4, 5],
+            },
+            index=["gene-a", "gene-b", "gene-c", "gene-d"],
+        ).to_csv(self.input_dir / "ExpressionData.csv")
+
+        with self.assertRaisesRegex(ValueError, "requires at least 4 cells"):
+            runner.generateInputs()
+
+    def test_ppcor_r_script_has_a_final_gene_cell_preflight(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "Algorithms"
+            / "PPCOR"
+            / "runPPCOR.R"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("if (geneCount >= cellCount)", script)
+        self.assertIn("any(!is.finite(pcorResults$p.value))", script)
+
     def test_scsgl_forwards_density_and_association_parameters(self):
         runner, commands = self.make_runner(
             SCSGLRunner,
@@ -387,6 +440,156 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         generated_b = pd.read_csv(self.working_dir / "ExpressionData1.csv")
         self.assertEqual(len(generated_a.columns) - 1, 3)
         self.assertEqual(len(generated_b.columns) - 1, 3)
+
+    def test_trajectory_runner_consumes_canonicalized_single_column_pseudotime(self):
+        runner, _commands = self.make_runner(
+            SCODERunner,
+            {"z": 2, "nIter": 5, "nRep": 2},
+        )
+        pd.DataFrame(
+            {"PseudoTime1": range(len(self.expression.columns))},
+            index=list(reversed(self.expression.columns)),
+        ).to_csv(self.input_dir / "PseudoTime.csv")
+
+        runner.generateInputs()
+
+        generated = pd.read_csv(
+            self.working_dir / "PseudoTime0.csv",
+            sep="\t",
+            header=None,
+            index_col=0,
+        )
+        self.assertEqual(list(generated.index), list(self.expression.columns))
+        self.assertEqual(generated.iloc[:, 0].tolist(), list(reversed(range(8))))
+
+    def test_trajectory_runner_rejects_uncanonicalized_single_column_file(self):
+        runner, _commands = self.make_runner(
+            SCODERunner,
+            {"z": 2, "nIter": 5, "nRep": 2},
+        )
+        (self.input_dir / "PseudoTime.csv").write_text(
+            "pseudotime\n0\n1\n2\n3\n4\n5\n6\n7\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "no trajectory columns"):
+            runner.generateInputs()
+
+    def test_scode_topk_ranks_by_magnitude_and_preserves_negative_coefficients(self):
+        runner, _commands = self.make_runner(
+            SCODERunner,
+            {
+                "z": 2,
+                "nIter": 5,
+                "nRep": 2,
+                "maxRegulatorsPerTarget": 1,
+            },
+        )
+        trajectory_dir = self.working_dir / "0"
+        trajectory_dir.mkdir()
+        pd.DataFrame(
+            [
+                [0.1, 0.2, -0.9],
+                [0.3, -0.4, 0.8],
+                [0.2, 0.1, 0.05],
+            ]
+        ).to_csv(
+            trajectory_dir / "meanA.txt",
+            sep="\t",
+            header=False,
+            index=False,
+        )
+
+        runner.parseOutput()
+
+        ranked = pd.read_csv(self.output_dir / "rankedEdges.csv", sep="\t")
+        target_edge = ranked[ranked["Gene2"] == "gene-c"].iloc[0]
+        self.assertEqual(target_edge["Gene1"], "gene-a")
+        self.assertEqual(target_edge["EdgeWeight"], -0.9)
+
+    def test_scode_multitrajectory_merge_keeps_strongest_signed_coefficient(self):
+        runner, _commands = self.make_runner(
+            SCODERunner,
+            {"z": 2, "nIter": 5, "nRep": 2},
+        )
+        pd.DataFrame(
+            {
+                "trajectory-a": range(len(self.expression.columns)),
+                "trajectory-b": range(len(self.expression.columns)),
+            },
+            index=self.expression.columns,
+        ).to_csv(self.input_dir / "PseudoTime.csv")
+        first = self.working_dir / "0"
+        second = self.working_dir / "1"
+        first.mkdir()
+        second.mkdir()
+        pd.DataFrame(
+            [
+                [0.0, -0.7, 0.1],
+                [0.2, 0.0, 0.3],
+                [0.1, 0.2, 0.0],
+            ]
+        ).to_csv(first / "meanA.txt", sep="\t", header=False, index=False)
+        pd.DataFrame(
+            [
+                [0.0, 0.6, 0.2],
+                [-0.9, 0.0, 0.1],
+                [0.1, 0.4, 0.0],
+            ]
+        ).to_csv(second / "meanA.txt", sep="\t", header=False, index=False)
+
+        runner.parseOutput()
+
+        ranked = pd.read_csv(self.output_dir / "rankedEdges.csv", sep="\t")
+        weights = {
+            (row.Gene1, row.Gene2): row.EdgeWeight
+            for row in ranked.itertuples(index=False)
+        }
+        self.assertEqual(weights[("gene-a", "gene-b")], -0.7)
+        self.assertEqual(weights[("gene-b", "gene-a")], -0.9)
+
+    def test_sincerities_uses_reported_regulatory_mode_as_edge_sign(self):
+        runner, _commands = self.make_runner(
+            SINCERITIESRunner,
+            {
+                "maxGenes": 3,
+                "nBins": 2,
+                "maxRegulatorsPerTarget": 1,
+            },
+        )
+        (self.working_dir / "outFile0.txt").write_text(
+            "SourceGENES,TargetGENES,Interaction,Edges\n"
+            "gene-c,gene-a,0.9,repression\n"
+            "gene-c,gene-b,0.8,activation\n"
+            "gene-b,gene-a,0.4,activation\n",
+            encoding="utf-8",
+        )
+
+        runner.parseOutput()
+
+        ranked = pd.read_csv(self.output_dir / "rankedEdges.csv", sep="\t")
+        target_edge = ranked[ranked["Gene2"] == "gene-c"].iloc[0]
+        self.assertEqual(target_edge["Gene1"], "gene-a")
+        self.assertEqual(target_edge["EdgeWeight"], -0.9)
+
+    def test_grnvbem_uses_signed_score_instead_of_unsigned_probability(self):
+        runner, _commands = self.make_runner(
+            GRNVBEMRunner,
+            {"maxGenes": 3},
+        )
+        (self.working_dir / "outFile0.txt").write_text(
+            "Parent - Child Weight Probability Score\n"
+            "gene-a\t-\tgene-c\t-0.8\t0.95\t-0.7\n"
+            "gene-b\t+\tgene-c\t0.4\t0.99\t0.3\n",
+            encoding="utf-8",
+        )
+
+        runner.parseOutput()
+
+        ranked = pd.read_csv(self.output_dir / "rankedEdges.csv", sep="\t")
+        weights = dict(zip(ranked["Gene1"], ranked["EdgeWeight"]))
+        self.assertEqual(weights["gene-a"], -0.7)
+        self.assertEqual(weights["gene-b"], 0.3)
 
     def test_ppcor_uses_the_selected_p_value_cutoff(self):
         runner, _commands = self.make_runner(PPCORRunner, {"pVal": 0.05})

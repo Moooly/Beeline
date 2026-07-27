@@ -42,9 +42,9 @@ The Dockerfile will run the PPCOR algorithm within the Docker container.
 
 5. **Create ppcorRunner.py script:** After buliding the Docker image, create a Python script called ppcorRunner.py in Beeline/BLRun folder to setup BLRun objects to read inputs and run PPCOR inside the Docker image, and also parse the output for evaluation. Specifically, the ppcorRunner.py script contains three functions:
 
-   - ``generateInputs()`` : This function reads the input data file (i.e., expression data), and processes them into the format required by the PPCOR. 
+   - ``generateInputs()`` : This function reads the expression data and applies PPCOR's mandatory gene safeguard. It keeps at most the configured ``maxGenes`` highest-variance genes and always keeps fewer genes than cells so PPCOR can provide partial-correlation p-values.
    - ``run()`` : This function constructs a "docker run" system command with parameters including the path of input data file (i.e., expression data). It also specifies where the outputs are written. The docker container run PPCOR when the parameters are passed. 
-   - ``parseOutput()`` : This function reads the ppcor-specific output (i.e., outFile.txt) and formats it into a ranked edgelist comma-separated file (i.e., rankedEdges.csv) with columns Gene1, Gene2, and EdgeWeight. The Gene1 column should contain regulators, the Gene2 column the targets, and EdgeWeight column the absolute value of the weight predicted for edge (regulator,target). The ranked edgelist file will be subsequently used by BLEval object. 
+   - ``parseOutput()`` : This function reads the PPCOR-specific output and formats it into a ranked edge list (``rankedEdges.csv``) with columns Gene1, Gene2, and EdgeWeight. Gene1 and Gene2 identify the associated genes, and EdgeWeight retains the signed partial-correlation coefficient for edges passing the configured p-value cutoff. Edges are ranked by absolute magnitude without discarding their sign.
 
 6. **Add PPCOR to runner.py:** Next, update runner.py script in Beeline/BLRun folder by adding information related to PPCOR. 
 
@@ -58,6 +58,8 @@ The Dockerfile will run the PPCOR algorithm within the Docker container.
         - name: "PPCOR"
           params: 
               should_run: [True]
+              # mandatory maximum gene count (also bounded below the cell count)
+              maxGenes: [500]
               # p-value cutoff
               # Used in parsing output
               pVal: [0.01]

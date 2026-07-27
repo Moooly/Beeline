@@ -1,15 +1,17 @@
 #!/usr/bin/env Rscript
 
 # Estimate a pseudotime trajectory for a scRNA-seq expression matrix using the
-# same pipeline BEELINE's preprocessing uses: log-transform -> PCA -> cluster
-# -> Slingshot. Produces a BEELINE-compatible PseudoTime.csv so datasets that
-# arrive without pseudotime can still run the trajectory-based GRN methods.
+# same pipeline BEELINE's preprocessing uses: state-aware expression preparation
+# -> PCA -> cluster -> Slingshot. Produces a BEELINE-compatible PseudoTime.csv
+# so datasets that arrive without pseudotime can still run the trajectory-based
+# GRN methods.
 #
 # See README.md for the full interface. Summary:
 #   Rscript estimate_pseudotime.R \
 #     --expression ExpressionData.csv \
 #     [--clusters ClusterLabels.csv] \
 #     [--startCluster <label>] \
+#     [--matrixState raw|normalized|log_normalized] \
 #     [--nPCs 20] [--nClusters 10] [--seed 1] \
 #     --output PseudoTime.csv
 
@@ -25,6 +27,12 @@ option_list <- list(
               help = "Optional ClusterLabels.csv (cell name in first column, cluster label in the next)."),
   make_option(c("-s", "--startCluster"), type = "character", default = NULL,
               help = "Optional starting cluster label used as the trajectory root."),
+  make_option(c("--matrixState"), type = "character", default = "raw",
+              help = paste0(
+                "Input expression state: raw, normalized, or log_normalized. ",
+                "GRNScope passes log_normalized after applying its shared preprocessing ",
+                "contract [default %default]."
+              )),
   make_option(c("-o", "--output"), type = "character", default = "PseudoTime.csv",
               help = "Output PseudoTime.csv path [default %default]."),
   make_option(c("--nPCs"), type = "integer", default = 20,
@@ -64,21 +72,52 @@ cell_by_gene <- t(expression)
 cell_names <- rownames(cell_by_gene)
 cat(sprintf("  %d cells x %d genes\n", nrow(cell_by_gene), ncol(cell_by_gene)))
 
-# --- 2. Log-transform and drop zero-variance genes ---------------------------
-log_expression <- log2(cell_by_gene + 1)
-gene_variance <- apply(log_expression, 2, stats::var)
-log_expression <- log_expression[, gene_variance > 0, drop = FALSE]
-if (ncol(log_expression) < 2) {
+# --- 2. Respect the declared matrix state and drop zero-variance genes --------
+matrix_state <- tolower(trimws(opt$matrixState))
+if (!(matrix_state %in% c("raw", "normalized", "log_normalized"))) {
+  fail("--matrixState must be raw, normalized, or log_normalized.")
+}
+if (any(!is.finite(cell_by_gene))) {
+  fail("Expression matrix contains a non-finite value.")
+}
+if (matrix_state %in% c("raw", "normalized") && any(cell_by_gene < 0)) {
+  fail("Raw and normalized expression matrices cannot contain negative values.")
+}
+
+analysis_expression <- cell_by_gene
+applied_operations <- character(0)
+if (matrix_state == "raw") {
+  cell_totals <- rowSums(analysis_expression)
+  positive_totals <- cell_totals > 0
+  analysis_expression[positive_totals, ] <- (
+    analysis_expression[positive_totals, , drop = FALSE] *
+      (10000 / cell_totals[positive_totals])
+  )
+  applied_operations <- c(applied_operations, "normalize_total")
+}
+if (matrix_state %in% c("raw", "normalized")) {
+  analysis_expression <- log1p(analysis_expression)
+  applied_operations <- c(applied_operations, "log1p")
+}
+cat(sprintf(
+  "Matrix state: %s; applied operations: %s\n",
+  matrix_state,
+  if (length(applied_operations)) paste(applied_operations, collapse = ", ") else "none"
+))
+
+gene_variance <- apply(analysis_expression, 2, stats::var)
+analysis_expression <- analysis_expression[, gene_variance > 0, drop = FALSE]
+if (ncol(analysis_expression) < 2) {
   fail("No variable genes remain after filtering; cannot build a trajectory.")
 }
 
 # --- 3. PCA embedding --------------------------------------------------------
-n_pcs <- min(opt$nPCs, ncol(log_expression), nrow(log_expression) - 1)
+n_pcs <- min(opt$nPCs, ncol(analysis_expression), nrow(analysis_expression) - 1)
 if (n_pcs < 2) {
   fail("Not enough dimensions for a PCA embedding.")
 }
 cat(sprintf("Computing PCA (%d components)\n", n_pcs))
-pca <- stats::prcomp(log_expression, center = TRUE, scale. = FALSE)
+pca <- stats::prcomp(analysis_expression, center = TRUE, scale. = FALSE)
 reduced <- pca$x[, seq_len(n_pcs), drop = FALSE]
 
 # --- 4. Cluster labels (provided, or k-means) --------------------------------
