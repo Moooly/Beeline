@@ -35,6 +35,10 @@ option_list <- list(
               )),
   make_option(c("-o", "--output"), type = "character", default = "PseudoTime.csv",
               help = "Output PseudoTime.csv path [default %default]."),
+  make_option(c("--embeddingOutput"), type = "character", default = NULL,
+              help = "Optional CSV path for the PCA coordinates used by Slingshot."),
+  make_option(c("--curvesOutput"), type = "character", default = NULL,
+              help = "Optional CSV path for the fitted Slingshot principal curves."),
   make_option(c("--nPCs"), type = "integer", default = 20,
               help = "Number of principal components used for the embedding [default %default]."),
   make_option(c("--nClusters"), type = "integer", default = 10,
@@ -185,9 +189,74 @@ if (is.null(dim(pseudotime))) {
   pseudotime <- matrix(pseudotime, ncol = 1)
 }
 
-colnames(pseudotime) <- paste0("PseudoTime", seq_len(ncol(pseudotime)))
+lineage_names <- paste0("PseudoTime", seq_len(ncol(pseudotime)))
+colnames(pseudotime) <- lineage_names
 rownames(pseudotime) <- cell_names
 cat(sprintf("Recovered %d lineage(s) across %d cells\n", ncol(pseudotime), nrow(pseudotime)))
+
+# Preserve the coordinate system and the actual principal curves used by
+# Slingshot. GRNScope can then render the fitted trajectory instead of
+# reconstructing a visual guide from pseudotime-bin centroids.
+if (!is.null(opt$embeddingOutput)) {
+  embedding_frame <- data.frame(
+    cell = cell_names,
+    x = reduced[, 1],
+    y = reduced[, 2],
+    check.names = FALSE
+  )
+  write.csv(
+    embedding_frame,
+    file = opt$embeddingOutput,
+    quote = FALSE,
+    row.names = FALSE
+  )
+  cat(sprintf("Wrote %s\n", opt$embeddingOutput))
+}
+
+if (!is.null(opt$curvesOutput)) {
+  fitted_curves <- slingCurves(slingshot_fit)
+  curve_frames <- lapply(seq_along(fitted_curves), function(lineage_index) {
+    curve <- fitted_curves[[lineage_index]]
+    curve_order <- curve$ord
+    curve_coordinates <- curve$s[curve_order, , drop = FALSE]
+    curve_pseudotime <- curve$lambda[curve_order]
+    finite <- (
+      is.finite(curve_coordinates[, 1]) &
+      is.finite(curve_coordinates[, 2]) &
+      is.finite(curve_pseudotime)
+    )
+    curve_coordinates <- curve_coordinates[finite, , drop = FALSE]
+    curve_pseudotime <- curve_pseudotime[finite]
+    data.frame(
+      lineage = lineage_names[lineage_index],
+      point_order = seq_len(nrow(curve_coordinates)),
+      x = curve_coordinates[, 1],
+      y = curve_coordinates[, 2],
+      pseudotime = curve_pseudotime,
+      check.names = FALSE
+    )
+  })
+  curve_frames <- Filter(function(frame) nrow(frame) > 0, curve_frames)
+  if (length(curve_frames)) {
+    curve_frame <- do.call(rbind, curve_frames)
+  } else {
+    curve_frame <- data.frame(
+      lineage = character(0),
+      point_order = integer(0),
+      x = numeric(0),
+      y = numeric(0),
+      pseudotime = numeric(0),
+      check.names = FALSE
+    )
+  }
+  write.csv(
+    curve_frame,
+    file = opt$curvesOutput,
+    quote = FALSE,
+    row.names = FALSE
+  )
+  cat(sprintf("Wrote %s\n", opt$curvesOutput))
+}
 
 # --- 7. Write PseudoTime.csv -------------------------------------------------
 # Standard index+lineage layout: an empty corner cell heads the cell-name
