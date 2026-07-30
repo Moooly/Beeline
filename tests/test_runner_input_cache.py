@@ -20,6 +20,41 @@ class MinimalRunner(Runner):
 
 
 class RunnerInputCacheTests(unittest.TestCase):
+    def test_pseudotime_loading_does_not_require_dataframe_to_numpy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            expression_source = root / "expression.csv"
+            pseudotime_source = root / "pseudotime.csv"
+            expression_source.write_text(
+                ",cell-a,cell-b\n"
+                "gene-a,1,2\n",
+                encoding="utf-8",
+            )
+            pseudotime_source.write_text(
+                ",trajectory\n"
+                "cell-a,0.1\n"
+                "cell-b,0.2\n",
+                encoding="utf-8",
+            )
+            runner_module._DATAFRAME_CACHE.clear()
+            instance = MinimalRunner.__new__(MinimalRunner)
+            instance.input_dir = root
+            instance.exprData = "unused-expression.csv"
+            instance.pseudoTimeData = "unused-pseudotime.csv"
+            instance.expression_source = expression_source
+            instance.pseudotime_source = pseudotime_source
+            instance.selected_cells_file = None
+            instance._selected_cells_cache = None
+
+            with patch.object(
+                runner_module.pd.DataFrame,
+                "to_numpy",
+                side_effect=AssertionError("to_numpy is unavailable"),
+            ):
+                observed = instance.read_pseudotime_data()
+
+            self.assertEqual(observed.iloc[:, 0].tolist(), [0.1, 0.2])
+
     def test_source_matrix_is_parsed_once_and_sliced_for_each_run(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

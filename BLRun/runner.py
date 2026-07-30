@@ -305,11 +305,11 @@ class Runner(ABC):
 
         numeric_pseudotime = pseudotime.apply(pd.to_numeric, errors="coerce")
         invalid_values = pseudotime.notna() & numeric_pseudotime.isna()
-        if invalid_values.to_numpy().any():
+        if np.asarray(invalid_values).any():
             raise ValueError(
                 "Pseudotime contains a non-numeric value outside blank/NA cells."
             )
-        finite_values = numeric_pseudotime.to_numpy(dtype=float)
+        finite_values = np.asarray(numeric_pseudotime, dtype=float)
         if np.isinf(finite_values).any():
             raise ValueError("Pseudotime contains a non-finite value.")
 
