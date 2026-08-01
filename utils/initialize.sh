@@ -15,7 +15,8 @@ SETUP_FAILURES=()
 # Tested published images to PULL, for algorithms we did NOT modify inside the
 # image. Any changes to these algorithms live host-side (BLRun/*.py + GRNScope),
 # NOT in the image, so the published DockerHub builds are correct and reliable.
-# (arboreto is excluded — we build it locally; celloracle is not published.)
+# (arboreto, SCRIBE, and SINGE are excluded because the fork changes content
+# baked into those images; celloracle and slingshot are not published.)
 # ---------------------------------------------------------------------------
 PULL_IMAGES=(
     grnbeeline/grisli:base
@@ -24,18 +25,20 @@ PULL_IMAGES=(
     grnbeeline/pidc:base
     grnbeeline/ppcor:base
     grnbeeline/scode:base
-    grnbeeline/scribe:base
     grnbeeline/sincerities:base
-    grnbeeline/singe:0.4.1
 )
 
 # Images that MUST be built locally. The default run builds exactly these:
 #   ARBORETO   — contains our modified runArboreto.py (GENIE3 / GRNBOOST2)
 #   CELLORACLE — new algorithm, not published to DockerHub
+#   SCRIBE     — contains our modified parallel runScribe.R entrypoint
+#   SINGE      — installs runtime tools required by our modified runner
 #   SLINGSHOT  — new pseudotime estimator, not published to DockerHub
 LOCAL_ONLY_TARGETS=(
     "ARBORETO=grnbeeline/arboreto:base"
     "CELLORACLE=grnbeeline/celloracle:base"
+    "SCRIBE=grnbeeline/scribe:base"
+    "SINGE=grnbeeline/singe:0.4.1"
     "SLINGSHOT=grnbeeline/slingshot:0.1.0"
 )
 
@@ -70,6 +73,8 @@ show_help() {
   echo "  2. Build ONLY the images that must be local:"
   echo "       - arboreto   (modified: GENIE3 / GRNBOOST2)"
   echo "       - celloracle (new, not published)"
+  echo "       - scribe     (modified parallel R entrypoint)"
+  echo "       - singe      (modified runtime dependencies)"
   echo "       - slingshot  (new pseudotime estimator, not published)"
   echo "  It does not rebuild images that do not need local changes."
   echo ""
@@ -82,7 +87,7 @@ show_help() {
   echo "                    with --build to remove then rebuild)."
   echo ""
   echo "Examples:"
-  echo "  $(basename "$0")               # correct setup: pull + build arboreto/celloracle"
+  echo "  $(basename "$0")               # pull unchanged images + build required local images"
   echo "  $(basename "$0") --build       # build every image with one command"
   echo "  $(basename "$0") --build-all   # same as --build"
 }
