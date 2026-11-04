@@ -1,6 +1,11 @@
 # Common env outputs
 __pycache__
 .vscode
+.DS_Store
+*.swp
+*.swo
+*.py[cod]
+.pytest_cache/
 
 # BEELINE specific files
 configs/
