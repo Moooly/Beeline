@@ -23,13 +23,20 @@ class SINCERITIESRunner(Runner):
             # The sign step computes a partial-correlation matrix across all
             # genes separately for each trajectory. Keep fewer genes than the
             # smallest trajectory's cell count so every matrix is estimable.
+            records = self._selected_cell_records()
+            source_by_output = ({record['output']: record['source'] for record in records}
+                                if records is not None else {})
             trajectory_cell_counts = [
-                int(PTData[column].notnull().sum()) for column in PTData.columns
+                len({source_by_output.get(str(cell), str(cell))
+                     for cell in PTData.index[PTData[column].notna()]})
+                for column in PTData.columns
             ]
             available_cells = min(
                 trajectory_cell_counts or [len(ExpressionData.columns)]
             )
-            max_genes = min(max_genes, max(2, available_cells - 1))
+            if available_cells < 3:
+                raise ValueError("SINCERITIES needs at least 3 distinct source cells in every trajectory.")
+            max_genes = min(max_genes, available_cells - 1)
             if len(ExpressionData.index) > max_genes:
                 variances = ExpressionData.var(axis=1, ddof=0)
                 retained_genes = (
@@ -39,6 +46,9 @@ class SINCERITIESRunner(Runner):
                 )
                 ExpressionData = ExpressionData.loc[retained_genes]
 
+        n_bins = int(self.params['nBins'])
+        if n_bins < 5:
+            raise ValueError("SINCERITIES requires at least 5 time bins.")
         colNames = PTData.columns
         for idx in range(len(colNames)):
             # Select cells belonging to each pseudotime trajectory
@@ -48,8 +58,10 @@ class SINCERITIESRunner(Runner):
             newExpressionData = ExpressionData.loc[:,index].T
             # Perform quantile binning as recommeded in the paper
             # http://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.qcut.html#pandas.qcut
-            nBins = int(self.params['nBins'])
+            nBins = n_bins
             tQuantiles = pd.qcut(PTData.loc[index,colName], q = nBins, duplicates ='drop')
+            if tQuantiles.isna().any() or tQuantiles.nunique() < 5:
+                raise ValueError("SINCERITIES requires at least 5 distinct, nonempty time bins after quantile binning.")
             mid = [(a.left + a.right)/2 for a in tQuantiles]
 
             newExpressionData['Time'] = mid
@@ -120,11 +132,10 @@ class SINCERITIESRunner(Runner):
         PTData = self.read_pseudotime_data()
         colNames = PTData.columns
 
-        # Quit if any trajectory output is missing (matches original behaviour).
+        # A missing trajectory must fail the run instead of publishing partial results.
         for idx in range(len(colNames)):
             if not (workDir / ('outFile'+str(idx)+'.txt')).exists():
-                print(str(workDir / ('outFile'+str(idx)+'.txt')) + ' does not exist, skipping...')
-                return
+                raise FileNotFoundError(workDir / ('outFile'+str(idx)+'.txt'))
 
         top_k = self._resolve_top_k()
 

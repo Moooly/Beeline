@@ -1,3 +1,5 @@
+import shlex
+from pathlib import Path
 import os
 import pandas as pd
 
@@ -24,15 +26,6 @@ class SCSGLRunner(Runner):
             ExpressionData.to_csv(SCSGL_EXPRESSION_FILE,
                                  sep = ',', header  = True)
 
-        SCSGL_GROUND_TRUTH_FILE = self.working_dir / "GroundTruthNetwork.csv"
-        if not SCSGL_GROUND_TRUTH_FILE.exists():
-            groundTruthNetworkData = pd.read_csv(self.ground_truth_file,
-                                         header = 0, index_col = 0)
-
-            # Write reference network data in SCSGL folder
-            groundTruthNetworkData.to_csv(SCSGL_GROUND_TRUTH_FILE,
-                                 sep = ',', header  = True)
-
     def run(self):
         '''
         Function to run SCSGL algorithm
@@ -42,13 +35,14 @@ class SCSGLRunner(Runner):
         neg_density = str(self.params['neg_density'])
         assoc = str(self.params['assoc'])
 
+        script_path = Path(__file__).resolve().parents[1] / 'Algorithms/SCSGL/run_scSGL.py'
         cmdToRun = ' '.join(['docker run --rm',
-                            f"-v {self.working_dir}:/usr/working_dir",
+                            f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
+                            f'-v {shlex.quote(str(script_path))}:/run_scSGL.py:ro',
                             '--expose=41269',
                             f'{self.image} /bin/sh -c \"time -v -o',
-                            "/usr/working_dir/time.txt", 'python run_scSGL.py',
+                            "/usr/working_dir/time.txt", 'python /run_scSGL.py',
                             '--expression_file=/usr/working_dir/ExpressionData.csv',
-                            '--ground_truth_net_file=/usr/working_dir/GroundTruthNetwork.csv',
                             '--out_file=/usr/working_dir/outFile.txt',
                             '--pos_density='+pos_density, '--neg_density='+neg_density, '--assoc='+assoc,
                             '\"'])
@@ -64,11 +58,10 @@ class SCSGLRunner(Runner):
 
         # Quit if output file does not exist
         if not outFile.exists():
-            print(str(outFile) + ' does not exist, skipping...')
-            return
+            raise FileNotFoundError(outFile)
 
         # Read output file
-        OutDF = pd.read_csv(outFile, sep = '\t', header = 0)
+        OutDF = pd.read_csv(outFile, sep = '\t', header = 0, converters={0: str, 1: str})
 
         OutDF.sort_values(by="EdgeWeight", ascending=False, inplace=True)
 

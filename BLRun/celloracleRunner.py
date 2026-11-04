@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import atexit
 import csv
-import heapq
 import json
 import os
 from pathlib import Path
@@ -365,8 +364,7 @@ class CellOracleRunner(Runner):
 
         # Quit if output file does not exist
         if not outFile.exists():
-            print(str(outFile) + ' does not exist, skipping...')
-            return
+            raise FileNotFoundError(outFile)
 
         top_k = self._resolve_top_k()
 
@@ -379,40 +377,21 @@ class CellOracleRunner(Runner):
 
         self._parse_output_full(outFile)
 
-    def _parse_output_topk(self, outFile, top_k):
-        target_heaps: dict = {}
-        sequence = 0
-        with outFile.open('r', newline='') as handle:
+    @staticmethod
+    def _iter_output_edges(out_file):
+        with out_file.open(newline='') as handle:
             reader = csv.reader(handle, delimiter='\t')
-            next(reader, None)  # header: Gene1 Gene2 EdgeWeight
+            if next(reader, None) != ['Gene1', 'Gene2', 'EdgeWeight']:
+                raise ValueError('CellOracle output is missing its expected header.')
             for row in reader:
-                if len(row) < 3:
-                    continue
-                try:
-                    weight = float(row[2])
-                except ValueError:
-                    continue
-                gene1, gene2 = row[0], row[1]
-                # GRNScope groups by Gene2 (target).
-                heap = target_heaps.setdefault(gene2, [])
-                item = (abs(weight), sequence, gene1, gene2, weight)
-                sequence += 1
-                if len(heap) < top_k:
-                    heapq.heappush(heap, item)
-                elif abs(weight) > heap[0][0]:
-                    heapq.heapreplace(heap, item)
+                if len(row) != 3:
+                    raise ValueError('Malformed CellOracle edge row.')
+                yield row
 
-        ranked_rows = []
-        for heap in target_heaps.values():
-            for _abs_weight, _seq, gene1, gene2, weight in sorted(
-                heap, key=lambda entry: (-entry[0], entry[1])
-            ):
-                ranked_rows.append((gene1, gene2, weight))
-
-        self._write_ranked_edges(
-            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
-        )
+    def _parse_output_topk(self, outFile, top_k):
+        from BLRun.edges import reduce_edges
+        self._write_ranked_edges(reduce_edges([self._iter_output_edges(outFile)], top_k))
 
     def _parse_output_full(self, outFile):
-        OutDF = pd.read_csv(outFile, sep='\t', header=0)
-        self._write_ranked_edges(OutDF[['Gene1', 'Gene2', 'EdgeWeight']])
+        from BLRun.edges import reduce_edges
+        self._write_ranked_edges(reduce_edges([self._iter_output_edges(outFile)]))

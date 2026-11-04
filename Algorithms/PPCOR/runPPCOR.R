@@ -46,6 +46,7 @@ if (
 # https://stackoverflow.com/questions/38664241/ranking-and-counting-matrix-elements-in-r
 DF = data.frame(Gene1 = geneNames[c(row(pcorResults$estimate))], Gene2 = geneNames[c(col(pcorResults$estimate))]
                 , corVal = c(pcorResults$estimate), pValue =  c(pcorResults$p.value))
+DF <- DF[DF$Gene1 != DF$Gene2, ]
 outDF <- DF[order(DF$corVal, decreasing=TRUE), ]
 if (!is.na(pValueCutoff) && topK > 0) {
     outDF$EdgeWeight <- ifelse(
@@ -56,7 +57,7 @@ if (!is.na(pValueCutoff) && topK > 0) {
     outDF$.sequence <- seq_len(nrow(outDF))
     groups <- split(outDF, outDF$Gene2, drop = TRUE)
     groups <- lapply(groups, function(group) {
-        ordered <- group[order(-abs(group$EdgeWeight), group$.sequence), ]
+        ordered <- group[order(-abs(group$EdgeWeight), group$Gene1, method = "radix"), ]
         ordered[seq_len(min(topK, nrow(ordered))), ]
     })
     outDF <- do.call(rbind, groups)

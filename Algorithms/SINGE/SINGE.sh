@@ -1,4 +1,6 @@
 #!/bin/bash
+# Propagate inference failures to the runner before any later task starts.
+set -e
 # Bash script to run compiled MATLAB code
 # Requires MATLAB R2018a runtime library which can be downloaded from
 # https://www.mathworks.com/products/compiler/matlab-runtime.html
@@ -90,5 +92,6 @@ fi
 
 if [[ $validMode == 0 ]]; then 
 	echo Invalid SINGE mode. Please use one of the following modes: $mode1, $mode2, $mode3
+	exit 1
 	echo -e $usage
 fi

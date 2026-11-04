@@ -23,11 +23,12 @@ Gene1 <- geneNames[MAC_results[,'Row gene index']]
 Gene2 <- geneNames[MAC_results[,'Column gene index']]
 Score <- MAC_results[,'Correlation']
 outDF <- data.frame(Gene1, Gene2, Score)
-if (topK > 0) {
+outDF <- outDF[outDF$Gene1 != outDF$Gene2, ]
+if (topK > 0 && nrow(outDF) > 0) {
     outDF$.sequence <- seq_len(nrow(outDF))
     groups <- split(outDF, outDF$Gene2, drop = TRUE)
     groups <- lapply(groups, function(group) {
-        ordered <- group[order(-abs(group$Score), group$.sequence), ]
+        ordered <- group[order(-abs(group$Score), group$Gene1, method = "radix"), ]
         ordered[seq_len(min(topK, nrow(ordered))), ]
     })
     outDF <- do.call(rbind, groups)

@@ -13,15 +13,49 @@ Full documentation: [https://murali-group.github.io/Beeline/](https://murali-gro
 bash utils/setupAnacondaVENV.sh
 ```
 
-**2. Pull algorithm Docker images**
+**2. Set up all website Docker images with one command**
 
-`utils/initialize.sh` manages Docker images for all supported BEELINE algorithms. By default it pulls tested published images and builds the locally modified images. Pass `--build` to build every managed image locally from the Dockerfiles under `Algorithms/` with one command.
+Start Docker, then run this from the BEELINE directory:
 
 ```bash
-bash utils/initialize.sh [OPTIONS]
+bash utils/initialize.sh
 ```
 
-To build every managed algorithm image locally in one invocation:
+This prepares all 12 images required by the website, including **CellOracle**
+and the Slingshot pseudotime estimator:
+
+| Setup | Environments |
+|-------|--------------|
+| Pull published images | GRISLI, GRNVBEM, LEAP, PIDC, PPCOR, SCODE, SINCERITIES |
+| Build custom environments | ARBORETO (GENIE3 and GRNBoost2), CellOracle, SCRIBE, SINGE, Slingshot |
+
+Pearson runs directly in Python and needs no image. The custom environments
+retain our dependency configuration; upstream replacements have not all been
+validated. Docker reuses cached layers on subsequent runs, so rerunning this
+command does not automatically rebuild everything from scratch. Build output
+remains visible, and setup continues through individual failures before
+reporting them with a nonzero exit status.
+
+Images use `linux/amd64`, matching the published BEELINE images and legacy
+MATLAB runtimes. On Apple Silicon, enable x86 emulation in Docker Desktop;
+ARM Linux hosts also need working amd64 emulation. The initial custom builds
+can take substantial time and disk space, especially CellOracle's reference
+data and SINGE's MATLAB runtime.
+
+If a pull fails, setup uses an existing local amd64 image and reports a warning.
+If none exists, it attempts that algorithm's Dockerfile instead. Older source
+builds depend on external package repositories and may fail if those packages
+are no longer available. A successful setup verifies that each requested image
+is present for the expected architecture; it does not run inference tests.
+
+Preview setup without downloading anything or requiring Docker:
+
+```bash
+bash utils/initialize.sh --dry-run
+```
+
+To build every managed image from source, **also including the legacy JUMP3,
+PNI, SCNS, and scSGL methods outside the website**, use:
 
 ```bash
 bash utils/initialize.sh --build
@@ -31,10 +65,20 @@ bash utils/initialize.sh --build
 |------|-------------|
 | `-b` / `--build` | Build every managed image locally from source instead of pulling from DockerHub. |
 | `--build-all` | Alias for `--build`. |
-| `-v` / `--verbose` | Enable verbose Docker output. |
-| `--remove-local-images` | Remove locally built BEELINE images. If combined with `--build`, images are removed then rebuilt. |
-| `--remove-grnbeeline-images` | Remove pulled DockerHub (grnbeeline) images. If combined with `--build`, images are removed then rebuilt. |
+| `--dry-run` | Print the planned commands without pulling, building, or removing images. |
+| `-v` / `--verbose` | Use plain Docker build progress output. |
+| `--remove-images` | Remove all 16 managed image tags. |
+| `--remove-local-images` | Remove only the 5 custom environment tags listed above. |
+| `--remove-grnbeeline-images` | Remove only the 7 published environment tags listed above. |
 | `-h` / `--help` | Display usage information and exit. |
+
+Removal exits after cleanup unless combined with `--build`; choose only one
+removal scope. Images in use are not forcibly removed. These options select
+tags by group, regardless of whether an individual image was pulled or built.
+
+Keep the updated BEELINE checkout on the deployment server: runners mount
+current algorithm scripts from it into the containers. Preparing images alone
+does not deploy those host-side code changes.
 
 **3. Activate the environment**
 ```bash
@@ -57,6 +101,22 @@ python BLRunner.py -c config-files/Curated/VSC.yaml
 ```
 
 Each algorithm's output is written to `outputs/<dataset_id>/<run_id>/<algorithm_id>/rankedEdges.csv`.
+
+For an intentional retry that replaces an existing run, add `--overwrite`.
+Noninteractive and persistent-worker runs never prompt for input. `should_run`
+accepts either `true`/`false` or the legacy `[true]`/`[false]` form.
+
+See the [November 2026 audit notes](docs/audits/2026-11-02-implementation.md) for
+SCODE's corrected edge direction, deterministic edge-selection rules, inference
+seeds, validation results, and the optional Slingshot PCA solver. Old SCODE
+results require a new run to apply the correction.
+
+The [follow-up fixes](docs/audits/2026-11-03-follow-up.md) cover identifier/output
+validation, bounded input caching, SCRIBE memory and multi-delay handling, PIDC
+context caching, earlier Arboreto edge reduction, and SINGE container reuse.
+Existing SCRIBE results using multiple delays need a new run to apply the
+corrected per-pair delay selection; single-delay runs retain their behavior.
+
 
 ### 2. Evaluate results — `BLEvaluator.py`
 

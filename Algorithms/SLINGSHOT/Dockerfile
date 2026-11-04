@@ -15,6 +15,10 @@ FROM bioconductor/bioconductor_docker:RELEASE_3_18
 # CRAN dependency for CLI parsing.
 RUN R --no-save -e "install.packages('optparse', repos='https://cloud.r-project.org')"
 
+# Pin the iterative solver tested with this R/Matrix image. Full PCA remains
+# the default; the optional truncated solver has residual checks and a fallback.
+RUN R --no-save -e "install.packages('https://cran.r-project.org/src/contrib/Archive/irlba/irlba_2.3.5.1.tar.gz', repos=NULL, type='source')"
+
 # Slingshot from Bioconductor. DelayedMatrixStats is only *suggested* by
 # slingshot's dependency chain and is loaded lazily at run time (inside
 # slingshot()), so it must be installed explicitly or the run fails with
@@ -23,7 +27,7 @@ RUN R --no-save -e "BiocManager::install(c('slingshot', 'SingleCellExperiment', 
 
 # Fail the build early if anything (including the lazily-loaded namespaces
 # slingshot() reaches for) is missing.
-RUN R --no-save -e "library(slingshot); library(optparse); loadNamespace('DelayedMatrixStats'); cat('deps-ok\n')"
+RUN R --no-save -e "library(slingshot); library(optparse); library(irlba); loadNamespace('DelayedMatrixStats'); cat('deps-ok\n')"
 
 WORKDIR /app
 COPY estimate_pseudotime.R /app/estimate_pseudotime.R

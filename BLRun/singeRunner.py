@@ -1,6 +1,7 @@
+import shlex
 import csv
-import heapq
 import os
+from pathlib import Path
 import pandas as pd
 
 from BLRun.runner import Runner
@@ -59,6 +60,8 @@ class SINGERunner(Runner):
                 params[param] = val
 
         num_replicates = int(params['num_replicates'])
+        if num_replicates < 1:
+            raise ValueError('SINGE requires at least one replicate.')
         replicates = [
             ' '.join(
                 '--' + parameter.replace('_', '-') + ' ' + str(params[parameter])
@@ -93,7 +96,7 @@ class SINGERunner(Runner):
 
             prepare_commands.append(' '.join([
                 'docker run --rm --entrypoint /bin/sh',
-                f'-v {self.working_dir}:/usr/working_dir',
+                f'-v {shlex.quote(str(self.working_dir))}:/usr/working_dir',
                 f'{self.image} -c "',
                 convert_input_to_matfile,
                 '"',
@@ -111,34 +114,29 @@ class SINGERunner(Runner):
             log_prefix='singe-prepare',
         )
 
-        replicate_commands = []
+        # One short-lived container per allocated slot. Sequential tasks in
+        # that slot reuse the MATLAB extraction cache without a long-lived
+        # worker service or reduced replicate-level concurrency.
+        slot_tasks = [[] for _ in range(min(worker_limit, len(trajectory_inputs) * num_replicates))]
+        task_index = 0
         for idx, input_mat, gene_list_mat, out_file_symlink, params_file in trajectory_inputs:
-            symlink_output = ' '.join([
-                'ln -s',
-                '/usr/working_dir/' + str(idx) + '/',
-                out_file_symlink,
-            ])
             for replicate in range(num_replicates):
-                replicate_commands.append(' '.join([
-                    'docker run --rm --entrypoint /bin/sh',
-                    f'-v {self.working_dir}:/usr/working_dir',
-                    f'{self.image} -c "',
-                    symlink_output,
-                    '&& time -v -o',
-                    f'/usr/working_dir/time{idx}-replicate-{replicate}.txt',
+                slot_tasks[task_index % len(slot_tasks)].append(' '.join([
+                    'ln -sfn', '/usr/working_dir/' + str(idx) + '/', out_file_symlink,
+                    '&& time -v -o', f'/usr/working_dir/time{idx}-replicate-{replicate}.txt',
                     '/usr/local/SINGE/SINGE.sh /usr/local/MATLAB/MATLAB_Runtime/v94 GLG',
-                    input_mat,
-                    gene_list_mat,
-                    out_file_symlink,
-                    params_file,
-                    str(replicate + 1),
-                    '"',
+                    input_mat, gene_list_mat, out_file_symlink, params_file, str(replicate + 1),
                 ]))
-
+                task_index += 1
+        wrapper = Path(__file__).resolve().parents[1] / 'Algorithms/SINGE/SINGE.sh'
+        replicate_commands = [' '.join([
+            'docker run --rm --entrypoint /bin/sh',
+            f'-v {shlex.quote(str(self.working_dir))}:/usr/working_dir',
+            f'-v {shlex.quote(str(wrapper))}:/usr/local/SINGE/SINGE.sh:ro',
+            f'{self.image} -c', shlex.quote(' && '.join(tasks)),
+        ]) for tasks in slot_tasks]
         self._run_docker_batch(
-            replicate_commands,
-            append=True,
-            max_workers=worker_limit,
+            replicate_commands, append=True, max_workers=worker_limit,
             log_prefix='singe-replicate',
         )
 
@@ -151,7 +149,8 @@ class SINGERunner(Runner):
             ])
             aggregate_commands.append(' '.join([
                 'docker run --rm --entrypoint /bin/sh',
-                f'-v {self.working_dir}:/usr/working_dir',
+                f'-v {shlex.quote(str(self.working_dir))}:/usr/working_dir',
+                f'-v {shlex.quote(str(wrapper))}:/usr/local/SINGE/SINGE.sh:ro',
                 f'{self.image} -c "',
                 symlink_output,
                 '&& time -v -o',
@@ -198,24 +197,14 @@ class SINGERunner(Runner):
 
         colNames = PTData.columns
 
-        # Quit if any trajectory output is missing (matches original behaviour).
+        # A missing trajectory must fail the run instead of publishing partial results.
         for idx in range(len(colNames)):
             if not (workDir / str(idx) / 'SINGE_Ranked_Edge_List.txt').exists():
-                print(str(workDir / str(idx) / 'SINGE_Ranked_Edge_List.txt') + ' does not exist, skipping...')
-                return
+                raise FileNotFoundError(workDir / str(idx) / 'SINGE_Ranked_Edge_List.txt')
 
-        top_k = self._resolve_top_k()
-
-        # Bounded fast path: a single trajectory with a per-target cap. With one
-        # trajectory there is no cross-trajectory max, so keeping only the top-K
-        # edges per target (by |EdgeWeight|) in a heap is exact and never loads
-        # the full g^2 edge list into memory.
-        if top_k is not None and len(colNames) == 1:
-            self._parse_output_topk(workDir / '0' / 'SINGE_Ranked_Edge_List.txt', top_k)
-            return
-
-        # General path: original full parse across all trajectories.
-        self._parse_output_full(workDir, colNames)
+        from BLRun.edges import reduce_edges
+        streams = (self._iter_edges(workDir / str(index) / 'SINGE_Ranked_Edge_List.txt') for index in range(len(colNames)))
+        self._write_ranked_edges(reduce_edges(streams, self._resolve_top_k()))
 
     def _resolve_top_k(self):
         '''
@@ -233,61 +222,21 @@ class SINGERunner(Runner):
             return None
         return top_k if top_k > 0 else None
 
+    @staticmethod
+    def _iter_edges(path):
+        with path.open('r') as handle:
+            next(handle, None)
+            for line in handle:
+                parts = line.split('\t')
+                if len(parts) != 3:
+                    raise ValueError("Malformed edge row in " + str(path))
+                yield parts[0], parts[1], float(parts[2])
+
     def _parse_output_topk(self, out_path, top_k):
-        '''
-        Stream a single trajectory's ranked edge list (tab-separated, with a
-        header) and keep only the top-K edges per target (Gene2, column 1) by
-        absolute weight in a heap, matching GRNScope's downstream per-target cap.
-        '''
-        target_heaps: dict = {}
-        sequence = 0
-        with out_path.open('r', newline='') as handle:
-            reader = csv.reader(handle, delimiter='\t')
-            next(reader, None)  # discard header row (column names are overwritten)
-            for row in reader:
-                if len(row) < 3:
-                    continue
-                try:
-                    weight = float(row[2])
-                except ValueError:
-                    continue
-                gene1, gene2 = row[0], row[1]
-                # GRNScope groups by Gene2 (target).
-                heap = target_heaps.setdefault(gene2, [])
-                item = (abs(weight), sequence, gene1, gene2, weight)
-                sequence += 1
-                if len(heap) < top_k:
-                    heapq.heappush(heap, item)
-                elif abs(weight) > heap[0][0]:
-                    heapq.heapreplace(heap, item)
-
-        ranked_rows = []
-        for heap in target_heaps.values():
-            for _abs_weight, _seq, gene1, gene2, weight in sorted(
-                heap, key=lambda entry: (-entry[0], entry[1])
-            ):
-                ranked_rows.append((gene1, gene2, weight))
-
-        self._write_ranked_edges(
-            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
-        )
+        from BLRun.edges import reduce_edges
+        self._write_ranked_edges(reduce_edges([self._iter_edges(out_path)], top_k))
 
     def _parse_output_full(self, workDir, colNames):
-        '''
-        Original full parse: cross-trajectory max per edge, ranked descending.
-        '''
-        OutSubDF = [0]*len(colNames)
-        for idx in range(len(colNames)):
-            OutSubDF[idx] = pd.read_csv(workDir / str(idx) / 'SINGE_Ranked_Edge_List.txt',
-                                sep = '\t', header = 0)
-        # megre the dataframe by taking the maximum value from each DF
-        # Code from here:
-        # https://stackoverflow.com/questions/20383647/pandas-selecting-by-label-sometimes-return-series-sometimes-returns-dataframe
-        outDF = pd.concat(OutSubDF)
-        outDF.columns= ['Gene1','Gene2','EdgeWeight']
-        # Group by rows code is from here:
-        # https://stackoverflow.com/questions/53114609/pandas-how-to-remove-duplicate-rows-but-keep-all-rows-with-max-value
-        res = outDF[outDF['EdgeWeight'] == outDF.groupby(['Gene1','Gene2'])['EdgeWeight'].transform('max')]
-        # Sort values in the dataframe
-        finalDF = res.sort_values('EdgeWeight', ascending=False)
-        self._write_ranked_edges(finalDF[['Gene1', 'Gene2', 'EdgeWeight']])
+        from BLRun.edges import reduce_edges
+        self._write_ranked_edges(reduce_edges(
+            (self._iter_edges(workDir / str(index) / 'SINGE_Ranked_Edge_List.txt') for index in range(len(colNames)))))

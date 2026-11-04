@@ -1,5 +1,4 @@
 import csv
-import heapq
 import os
 from pathlib import Path
 import shlex
@@ -160,15 +159,14 @@ class PPCORRunner(Runner):
 
         # Quit if output file does not exist
         if not outFile.exists():
-            print(str(outFile) + ' does not exist, skipping...')
-            return
+            raise FileNotFoundError(outFile)
 
         p_val_cutoff = float(self.params['pVal'])
         top_k = self._resolve_top_k()
 
         header = pd.read_csv(outFile, sep='\t', nrows=0).columns
         if 'EdgeWeight' in header:
-            compact = pd.read_csv(outFile, sep='\t')
+            compact = pd.read_csv(outFile, sep='\t', converters={0: str, 1: str})
             self._write_ranked_edges(
                 compact[['Gene1', 'Gene2', 'EdgeWeight']]
             )
@@ -180,59 +178,15 @@ class PPCORRunner(Runner):
             self._parse_output_full(outFile, p_val_cutoff)
             return
 
-        # Bounded path: stream PPCOR's g x g edge list and keep only the top-K
-        # edges per target in a heap, so the full g^2 list is never loaded into
-        # memory. The edge weight matches the original: the signed partial
-        # correlation for significant edges (p <= cutoff), else 0.0. Self-loops
-        # and ranking are left as before so GRNScope's downstream top-K over this
-        # output is unchanged.
-        target_heaps: dict = {}
-        sequence = 0
-        with outFile.open('r', newline='') as handle:
-            reader = csv.reader(handle, delimiter='\t')
-            header = next(reader, None)
-            if header is None:
-                self._write_ranked_edges(
-                    pd.DataFrame(columns=['Gene1', 'Gene2', 'EdgeWeight'])
-                )
-                return
-            column = {name: index for index, name in enumerate(header)}
-            try:
-                gene1_col, gene2_col = column['Gene1'], column['Gene2']
-                cor_col, pval_col = column['corVal'], column['pValue']
-            except KeyError as exc:
-                raise ValueError(f"PPCOR output missing expected column: {exc}")
-
-            widest_column = max(gene1_col, gene2_col, cor_col, pval_col)
-            for row in reader:
-                if len(row) <= widest_column:
-                    continue
-                try:
-                    cor_val = float(row[cor_col])
-                    p_value = float(row[pval_col])
-                except ValueError:
-                    continue
-                gene1, gene2 = row[gene1_col], row[gene2_col]
-                weight = cor_val if p_value <= p_val_cutoff else 0.0
-                abs_weight = abs(weight)
-                heap = target_heaps.setdefault(gene2, [])
-                item = (abs_weight, sequence, gene1, gene2, weight)
-                sequence += 1
-                if len(heap) < top_k:
-                    heapq.heappush(heap, item)
-                elif abs_weight > heap[0][0]:
-                    heapq.heapreplace(heap, item)
-
-        ranked_rows = []
-        for heap in target_heaps.values():
-            for abs_weight, _seq, gene1, gene2, weight in sorted(
-                heap, key=lambda entry: (-entry[0], entry[1])
-            ):
-                ranked_rows.append((gene1, gene2, weight))
-
-        self._write_ranked_edges(
-            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
-        )
+        def edges():
+            with outFile.open('r', newline='') as handle:
+                reader = csv.DictReader(handle, delimiter='\t')
+                if not {'Gene1', 'Gene2', 'corVal', 'pValue'}.issubset(reader.fieldnames or []):
+                    raise ValueError("PPCOR output is missing expected columns.")
+                for row in reader:
+                    weight = float(row['corVal']) if float(row['pValue']) <= p_val_cutoff else 0.0
+                    yield row['Gene1'], row['Gene2'], weight
+        self._write_ranked_edges(self._merge_bounded_trajectory_edges([edges()], top_k))
 
     def _parse_output_full(self, outFile, p_val_cutoff):
         '''
@@ -240,7 +194,7 @@ class PPCORRunner(Runner):
         absolute partial correlation) first with their signed weight, then the
         remaining edges with weight 0.
         '''
-        OutDF = pd.read_csv(outFile, sep='\t', header=0)
+        OutDF = pd.read_csv(outFile, sep='\t', header=0, converters={0: str, 1: str})
         # edges with significant p-value
         part1 = OutDF.loc[OutDF['pValue'] <= p_val_cutoff]
         part1 = part1.assign(absCorVal=part1['corVal'].abs())

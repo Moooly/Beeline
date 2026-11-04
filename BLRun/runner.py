@@ -3,18 +3,20 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-import heapq
 import json
-from math import isfinite
+import csv
 import os
 from pathlib import Path
 import subprocess
 import numpy as np
 import pandas as pd
 
+from BLRun.edges import reduce_edges, reduce_frame
+
 
 _DATAFRAME_CACHE = {}
 _DATAFRAME_CACHE_LIMIT = 4
+_DATAFRAME_CACHE_BYTES = 256 * 1024 * 1024
 _DATAFRAME_CACHE_METRICS = {'hits': 0, 'misses': 0}
 
 
@@ -37,6 +39,9 @@ def _read_cached_dataframe(path: Path) -> pd.DataFrame:
     cached = _DATAFRAME_CACHE.get(cache_key)
     if cached is not None:
         _DATAFRAME_CACHE_METRICS['hits'] += 1
+        # Refresh insertion order for byte-bounded LRU eviction.
+        _DATAFRAME_CACHE.pop(cache_key)
+        _DATAFRAME_CACHE[cache_key] = cached
         return cached
 
     _DATAFRAME_CACHE_METRICS['misses'] += 1
@@ -44,11 +49,31 @@ def _read_cached_dataframe(path: Path) -> pd.DataFrame:
     stale_keys = [key for key in _DATAFRAME_CACHE if key[0] == str(resolved_path)]
     for stale_key in stale_keys:
         _DATAFRAME_CACHE.pop(stale_key, None)
-    while len(_DATAFRAME_CACHE) >= _DATAFRAME_CACHE_LIMIT:
-        _DATAFRAME_CACHE.pop(next(iter(_DATAFRAME_CACHE)))
-
-    dataframe = pd.read_csv(resolved_path, header=0, index_col=0)
-    _DATAFRAME_CACHE[cache_key] = dataframe
+    with resolved_path.open(newline='', encoding='utf-8-sig') as handle:
+        header = next(csv.reader(handle), [])
+    if not header or any(not name.strip() for name in header[1:]):
+        raise ValueError('Input must have nonempty column identifiers.')
+    if len(set(header[1:])) != len(header[1:]):
+        raise ValueError('Input column identifiers must be unique.')
+    # Do not use index_col here: pandas may infer an index's numeric type
+    # even when a converter was supplied. Convert the first column to an
+    # index only after reading it as literal text (including names like NA).
+    dataframe = pd.read_csv(resolved_path, header=0, converters={0: str})
+    identifiers = dataframe.iloc[:, 0]
+    dataframe = dataframe.iloc[:, 1:]
+    dataframe.index = pd.Index(identifiers.array, name=header[0] or None)
+    dataframe.columns = header[1:]
+    if any(not value.strip() for value in dataframe.index):
+        raise ValueError('Input row identifiers must be nonempty.')
+    size = int(dataframe.memory_usage(index=True, deep=True).sum())
+    if size <= _DATAFRAME_CACHE_BYTES:
+        def cache_bytes():
+            return sum(int(frame.memory_usage(index=True, deep=True).sum())
+                       for frame in _DATAFRAME_CACHE.values())
+        while _DATAFRAME_CACHE and (len(_DATAFRAME_CACHE) >= _DATAFRAME_CACHE_LIMIT
+                                   or cache_bytes() + size > _DATAFRAME_CACHE_BYTES):
+            _DATAFRAME_CACHE.pop(next(iter(_DATAFRAME_CACHE)))
+        _DATAFRAME_CACHE[cache_key] = dataframe
     return dataframe
 
 class Runner(ABC):
@@ -58,6 +83,12 @@ class Runner(ABC):
     Subclasses must implement generateInputs, run, and parseOutput.
     Attributes set here reflect the fields accessed by runner implementations.
     """
+
+    def release_input_views(self):
+        """Release batch-local copies once output parsing has finished."""
+        self._expression_view_cache = None
+        self._pseudotime_view_cache = None
+        self._selected_cells_cache = None
 
     def __init__(self, root: Path, config: dict):
         """
@@ -81,6 +112,16 @@ class Runner(ABC):
               algo_name: <str>  name of the algorithm (appended to output_dir)
               params: <dict>  algorithm-specific parameters
         """
+        for label, value in [
+            ('dataset_id', config['dataset']['dataset_id']),
+            ('run_id', config['dataset']['run_id']),
+            ('algo_name', config['algo_name']),
+            ('experiment_id', config['output_settings'].get('experiment_id', '')),
+        ]:
+            if label == 'experiment_id' and value == '':
+                continue
+            if not isinstance(value, str) or not value or value in ('.', '..') or any(c in value for c in '/\\\0'):
+                raise ValueError(label + ' must be a single nonempty path segment.')
         inp = config['input']
         ds  = config['dataset']
 
@@ -106,16 +147,6 @@ class Runner(ABC):
         self.output_dir = base_output
         self.working_dir = base_output / "working_dir"
 
-        # Erase working directory so stale inputs from prior runs are not reused.
-        if self.working_dir.exists():
-            for item in sorted(self.working_dir.rglob('*'), reverse=True):
-                item.unlink() if (item.is_file() or item.is_symlink()) else item.rmdir()
-            self.working_dir.rmdir()
-
-        # Pre-create output_dir and working_dir so docker cannot claim them as root.
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.working_dir.mkdir(parents=True, exist_ok=True)
-        
         # Precompute progress message for CLI output.
         self.running_message = (
             f"Running {config['algo_name']} | dataset: {ds['dataset_id']} | run: {ds['run_id']}"
@@ -142,7 +173,7 @@ class Runner(ABC):
         self.groundTruthNetwork = ds.get('groundTruthNetwork', 'GroundTruthNetwork.csv')
         # ground_truth_file: full path to the dataset-level ground truth CSV.
         self.ground_truth_file  = base_input / ds['dataset_id'] / self.groundTruthNetwork
-        
+
         # image: Docker image name used to run this algorithm (e.g. "grnbeeline/genie3:base").
         # Mandatory — every algorithm entry in the config must supply this field.
         if 'image' not in config or not config['image']:
@@ -174,6 +205,23 @@ class Runner(ABC):
             1,
             int(self.resource_settings.get('trajectory_workers', self.cpu_budget)),
         )
+
+        # Refuse cleanup if a misconfigured output would contain source data.
+        for source in (self.expression_input_path(), self.pseudotime_input_path()):
+            if self.working_dir.resolve() in source.resolve().parents:
+                raise ValueError('Working directory must not contain input files.')
+        if self.working_dir.is_symlink():
+            raise ValueError('Working directory must not be a symbolic link.')
+        # Erase working directory so stale inputs from prior runs are not reused.
+        if self.working_dir.exists():
+            for item in sorted(self.working_dir.rglob('*'), reverse=True):
+                item.unlink() if (item.is_file() or item.is_symlink()) else item.rmdir()
+            self.working_dir.rmdir()
+
+        # Pre-create output_dir and working_dir so docker cannot claim them as root.
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.working_dir.mkdir(parents=True, exist_ok=True)
+
 
     @contextmanager
     def resource_environment(self):
@@ -257,6 +305,8 @@ class Runner(ABC):
             return cached_view.copy(deep=False)
 
         expression = _read_cached_dataframe(self.expression_input_path())
+        if expression.index.has_duplicates or expression.columns.has_duplicates:
+            raise ValueError('Expression gene and cell identifiers must be unique.')
         selected_records = self._selected_cell_records()
         if selected_records is None:
             selected_expression = expression.copy()
@@ -367,8 +417,7 @@ class Runner(ABC):
         Parse raw algorithm output and write a ranked edge list to disk.
 
         Implementations should build a DataFrame with columns Gene1, Gene2,
-        EdgeWeight and pass it to self._write_ranked_edges(). Returns early
-        without writing if the expected output file is missing.
+        EdgeWeight and pass it to self._write_ranked_edges(). Raises an error if the expected raw output file is missing.
         """
 
     def _apply_docker_resource_limits(
@@ -454,6 +503,16 @@ class Runner(ABC):
                 f"See {resolved_output_path} for details."
             )
 
+    def _trajectory_worker_count(self, command_count, max_workers=None):
+        count = min(command_count, max(1, int(getattr(self, 'cpu_budget', 1))),
+                    max(1, int(getattr(self, 'trajectory_workers', getattr(self, 'cpu_budget', 1)))))
+        if max_workers is not None:
+            count = min(count, max(1, int(max_workers)))
+        memory = getattr(self, 'memory_budget_mb', None)
+        if memory is not None:
+            count = min(count, max(1, int(memory) // getattr(self, '_MIN_CONTAINER_MEMORY_MB', 512)))
+        return max(1, count)
+
     def _run_docker_batch(
         self,
         commands,
@@ -470,13 +529,8 @@ class Runner(ABC):
             return
 
         total_cpu_budget = max(1, int(getattr(self, 'cpu_budget', 1)))
-        trajectory_workers = max(
-            1,
-            int(getattr(self, 'trajectory_workers', total_cpu_budget)),
-        )
-        worker_count = min(len(commands), trajectory_workers, total_cpu_budget)
-        if max_workers is not None:
-            worker_count = min(worker_count, max(1, int(max_workers)))
+        worker_count = self._trajectory_worker_count(len(commands), max_workers)
+        self.execution_worker_count = max(worker_count, getattr(self, 'execution_worker_count', 1))
         if worker_count <= 1:
             for index, command in enumerate(commands):
                 self._run_docker(command, append=append or index > 0)
@@ -494,26 +548,30 @@ class Runner(ABC):
             for index in range(len(commands))
         ]
 
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(
-                    self._run_docker,
-                    command,
-                    cpu_budget=cpu_per_worker,
-                    memory_budget_mb=memory_per_worker,
-                    output_path=log_paths[index],
-                )
-                for index, command in enumerate(commands)
-            ]
-            for future in futures:
-                future.result()
-
-        output_mode = 'a' if append else 'w'
-        with (self.output_dir / 'output.txt').open(output_mode) as combined_output:
-            for log_path in log_paths:
-                if log_path.is_file():
-                    combined_output.write(log_path.read_text(errors='replace'))
-                    log_path.unlink()
+        succeeded = False
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(
+                        self._run_docker,
+                        command,
+                        cpu_budget=cpu_per_worker,
+                        memory_budget_mb=memory_per_worker,
+                        output_path=log_paths[index],
+                    )
+                    for index, command in enumerate(commands)
+                ]
+                for future in futures:
+                    future.result()
+            succeeded = True
+        finally:
+            output_mode = 'a' if append else 'w'
+            with (self.output_dir / 'output.txt').open(output_mode) as combined_output:
+                for log_path in log_paths:
+                    if log_path.is_file():
+                        combined_output.write(log_path.read_text(errors='replace'))
+                        if succeeded:
+                            log_path.unlink()
 
     def _write_ranked_edges(self, df: pd.DataFrame) -> None:
         """
@@ -550,11 +608,13 @@ class Runner(ABC):
         input_edge_count = int(len(df))
         top_k = self._resolve_output_top_k()
         bounded = self._top_edges_per_target(df[required_columns], top_k)
+        temporary_path = self.output_dir / 'rankedEdges.csv.tmp'
         bounded.to_csv(
-            self.output_dir / 'rankedEdges.csv',
+            temporary_path,
             sep='\t',
             index=False,
         )
+        temporary_path.replace(self.output_dir / 'rankedEdges.csv')
         self.output_reduction_observability = {
             'input_edge_count': input_edge_count,
             'retained_edge_count': int(len(bounded)),
@@ -573,145 +633,13 @@ class Runner(ABC):
         return value if value > 0 else None
 
     @staticmethod
-    def _top_edges_per_target(
-        edges: pd.DataFrame,
-        top_k: int | None,
-    ) -> pd.DataFrame:
-        """Apply the backend's stable absolute-score top-K rule before writing.
-
-        The heap and strict replacement comparison deliberately match
-        ``parse_ranked_edges_csv``. This makes the per-run file itself bounded
-        without changing which edges confidence aggregation consumes.
-        """
-        if top_k is None:
-            return edges.copy()
-
-        target_heaps = {}
-        sequence = 0
-        for row in edges.itertuples(index=False, name=None):
-            source, target, raw_weight = row
-            try:
-                weight = float(raw_weight)
-            except (TypeError, ValueError):
-                continue
-            if not isfinite(weight):
-                continue
-            heap = target_heaps.setdefault(str(target), [])
-            item = (abs(weight), sequence, str(source), str(target), weight)
-            sequence += 1
-            if len(heap) < top_k:
-                heapq.heappush(heap, item)
-            elif item[0] > heap[0][0]:
-                heapq.heapreplace(heap, item)
-
-        rows = []
-        for target, heap in target_heaps.items():
-            for _absolute, _sequence, source, _target, weight in sorted(
-                heap,
-                key=lambda item: (-item[0], item[2]),
-            ):
-                rows.append((source, target, weight))
-        return pd.DataFrame(rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
+    def _top_edges_per_target(edges, top_k):
+        return reduce_frame(edges, top_k)
 
     @classmethod
-    def _merge_bounded_trajectory_edges(
-        cls,
-        edge_streams,
-        top_k: int,
-    ) -> pd.DataFrame:
-        """Merge trajectory scores without materializing their full union.
-
-        Each stream yields ``(source, target, final_weight)``. Keeping top-K
-        candidates for every target in each trajectory is exact for a later
-        cross-trajectory maximum: an edge below K in the trajectory where it
-        reaches its maximum cannot enter the global top K.
-        """
-        best_by_edge = {}
-        sequence = 0
-        for edge_stream in edge_streams:
-            trajectory_heaps = {}
-            for source, target, raw_weight in edge_stream:
-                try:
-                    weight = float(raw_weight)
-                except (TypeError, ValueError):
-                    continue
-                if not isfinite(weight):
-                    continue
-                heap = trajectory_heaps.setdefault(str(target), [])
-                candidate = (
-                    abs(weight), sequence, str(source), str(target), weight
-                )
-                sequence += 1
-                if len(heap) < top_k:
-                    heapq.heappush(heap, candidate)
-                elif candidate[0] > heap[0][0]:
-                    heapq.heapreplace(heap, candidate)
-
-            for heap in trajectory_heaps.values():
-                for _absolute, candidate_sequence, source, target, weight in heap:
-                    key = (source, target)
-                    previous = best_by_edge.get(key)
-                    if previous is None or abs(weight) > abs(previous[0]):
-                        best_by_edge[key] = (weight, candidate_sequence)
-
-        candidates = pd.DataFrame(
-            [
-                (source, target, value[0], value[1])
-                for (source, target), value in best_by_edge.items()
-            ],
-            columns=['Gene1', 'Gene2', 'EdgeWeight', '_sequence'],
-        )
-        if candidates.empty:
-            return candidates[['Gene1', 'Gene2', 'EdgeWeight']]
-        candidates = candidates.sort_values('_sequence', kind='stable')
-        return cls._top_edges_per_target(
-            candidates[['Gene1', 'Gene2', 'EdgeWeight']],
-            top_k,
-        )
+    def _merge_bounded_trajectory_edges(cls, edge_streams, top_k):
+        return reduce_edges(edge_streams, top_k)
 
     @staticmethod
-    def _merge_trajectory_edges(edge_streams) -> pd.DataFrame:
-        """Keep each edge's strongest trajectory score without losing its sign.
-
-        Trajectory-aware runners historically selected the largest edge
-        magnitude across trajectories. The magnitude determines which
-        observation wins, while the original signed value remains the emitted
-        ``EdgeWeight``.
-        """
-        best_by_edge = {}
-        sequence = 0
-        for edge_stream in edge_streams:
-            for source, target, raw_weight in edge_stream:
-                try:
-                    weight = float(raw_weight)
-                except (TypeError, ValueError):
-                    continue
-                if not isfinite(weight):
-                    continue
-
-                source = str(source)
-                target = str(target)
-                key = (source, target)
-                previous = best_by_edge.get(key)
-                if previous is None or abs(weight) > abs(previous[0]):
-                    best_by_edge[key] = (weight, sequence)
-                sequence += 1
-
-        rows = [
-            (source, target, weight, first_seen)
-            for (source, target), (weight, first_seen) in best_by_edge.items()
-        ]
-        if not rows:
-            return pd.DataFrame(columns=['Gene1', 'Gene2', 'EdgeWeight'])
-
-        merged = pd.DataFrame(
-            rows,
-            columns=['Gene1', 'Gene2', 'EdgeWeight', '_sequence'],
-        )
-        merged['_absolute_weight'] = merged['EdgeWeight'].abs()
-        merged = merged.sort_values(
-            ['_absolute_weight', '_sequence'],
-            ascending=[False, True],
-            kind='stable',
-        )
-        return merged[['Gene1', 'Gene2', 'EdgeWeight']].reset_index(drop=True)
+    def _merge_trajectory_edges(edge_streams):
+        return reduce_edges(edge_streams)

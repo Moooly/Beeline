@@ -158,13 +158,12 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
             self.assertIn("--prob-zero-removal 0.2", line)
             self.assertIn("--prob-remove-samples 0.3", line)
             self.assertIn("--family poisson", line)
-        self.assertEqual(len(commands), 4)
+        self.assertEqual(len(commands), 3)
         self.assertIn("fullKp(1, 12)", commands[0][0])
         self.assertIn(" GLG ", commands[1][0])
         self.assertIn("hyperparameters.txt 1", commands[1][0])
-        self.assertIn(" GLG ", commands[2][0])
-        self.assertIn("hyperparameters.txt 2", commands[2][0])
-        self.assertIn(" Aggregate ", commands[3][0])
+        self.assertIn("hyperparameters.txt 2", commands[1][0])
+        self.assertIn(" Aggregate ", commands[2][0])
 
     def test_singe_parallel_workers_respect_cpu_and_memory(self):
         runner, _commands = self.make_runner(SINGERunner, {})
@@ -311,7 +310,7 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
             / "PIDC"
             / "runPIDC.jl"
         ).read_text(encoding="utf-8")
-        self.assertIn("get_nodes(dataset_name; delim='\\t')", script)
+        self.assertIn("get_nodes(path; delim='\\t')", script)
 
     def test_grnvbem_applies_its_highest_variance_gene_filter(self):
         runner, _commands = self.make_runner(
@@ -403,12 +402,12 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
     def test_sincerities_uses_the_selected_bin_count(self):
         runner, _commands = self.make_runner(
             SINCERITIESRunner,
-            {"maxGenes": 2, "nBins": 2},
+            {"maxGenes": 2, "nBins": 5},
         )
         runner.generateInputs()
 
         generated = pd.read_csv(self.working_dir / "ExpressionData0.csv")
-        self.assertEqual(generated["Time"].nunique(), 2)
+        self.assertEqual(generated["Time"].nunique(), 5)
         self.assertEqual(
             [column for column in generated.columns if column != "Time"],
             ["gene-a", "gene-b"],
@@ -417,7 +416,7 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
     def test_sincerities_stays_below_the_smallest_trajectory_cell_count(self):
         runner, _commands = self.make_runner(
             SINCERITIESRunner,
-            {"maxGenes": 5, "nBins": 2},
+            {"maxGenes": 5, "nBins": 5},
         )
         pd.DataFrame(
             {
@@ -429,7 +428,7 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         pd.DataFrame(
             {
                 "trajectory-a": range(8),
-                "trajectory-b": [0, 1, 2, 3, None, None, None, None],
+                "trajectory-b": [0, 1, 2, 3, 4, None, None, None],
             },
             index=self.expression.columns,
         ).to_csv(self.input_dir / "PseudoTime.csv")
@@ -438,8 +437,8 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
 
         generated_a = pd.read_csv(self.working_dir / "ExpressionData0.csv")
         generated_b = pd.read_csv(self.working_dir / "ExpressionData1.csv")
-        self.assertEqual(len(generated_a.columns) - 1, 3)
-        self.assertEqual(len(generated_b.columns) - 1, 3)
+        self.assertEqual(len(generated_a.columns) - 1, 4)
+        self.assertEqual(len(generated_b.columns) - 1, 4)
 
     def test_trajectory_runner_consumes_canonicalized_single_column_pseudotime(self):
         runner, _commands = self.make_runner(
@@ -503,8 +502,9 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
         runner.parseOutput()
 
         ranked = pd.read_csv(self.output_dir / "rankedEdges.csv", sep="\t")
-        target_edge = ranked[ranked["Gene2"] == "gene-c"].iloc[0]
-        self.assertEqual(target_edge["Gene1"], "gene-a")
+        # SCODE A[target, source] = coefficient in dx_target/dt.
+        target_edge = ranked[ranked["Gene2"] == "gene-a"].iloc[0]
+        self.assertEqual(target_edge["Gene1"], "gene-c")
         self.assertEqual(target_edge["EdgeWeight"], -0.9)
 
     def test_scode_multitrajectory_merge_keeps_strongest_signed_coefficient(self):
@@ -545,8 +545,8 @@ class AlgorithmRunnerParameterTests(unittest.TestCase):
             (row.Gene1, row.Gene2): row.EdgeWeight
             for row in ranked.itertuples(index=False)
         }
-        self.assertEqual(weights[("gene-a", "gene-b")], -0.7)
-        self.assertEqual(weights[("gene-b", "gene-a")], -0.9)
+        self.assertEqual(weights[("gene-a", "gene-b")], -0.9)
+        self.assertEqual(weights[("gene-b", "gene-a")], -0.7)
 
     def test_sincerities_uses_reported_regulatory_mode_as_edge_sign(self):
         runner, _commands = self.make_runner(

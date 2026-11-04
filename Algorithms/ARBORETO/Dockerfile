@@ -17,4 +17,4 @@ COPY runArboreto.py /
 
 RUN mkdir data/
 
-RUN apt-get install time
+RUN apt-get install -y --no-install-recommends time

@@ -36,6 +36,10 @@ class GENIE3Runner(Runner):
         # BEELINE runs without a params map behave exactly as before.
         n_estimators = str(self.params.get('nEstimators', 400))
         max_features = str(self.params.get('maxFeatures', 'sqrt'))
+        self.params.setdefault('seed', 1)
+        seed = int(self.params['seed'])
+        if not 0 <= seed <= 4294967295:
+            raise ValueError('Random seed must be between 0 and 4294967295.')
         top_k = str(self.params.get('maxRegulatorsPerTarget', 0))
 
         # Keep the runner and its CLI entrypoint on the same version.  The
@@ -71,6 +75,7 @@ class GENIE3Runner(Runner):
                             f'--nEstimators={n_estimators}',
                             f'--maxFeatures={max_features}',
                             f'--topK={top_k}',
+                            f'--seed={seed}',
                             f'--nWorkers={getattr(self, "cpu_budget", 1)}', '\"'])
 
         self._run_docker(cmdToRun)
@@ -84,11 +89,10 @@ class GENIE3Runner(Runner):
 
         # Quit if output file does not exist
         if not outFile.exists():
-            print(str(outFile) + ' does not exist, skipping...')
-            return
+            raise FileNotFoundError(outFile)
 
         # Read output
-        OutDF = pd.read_csv(outFile, sep = '\t', header = 0)
+        OutDF = pd.read_csv(outFile, sep = '\t', header = 0, converters={0: str, 1: str})
 
         self._write_ranked_edges(OutDF.rename(columns={
             'TF': 'Gene1', 'target': 'Gene2', 'importance': 'EdgeWeight'

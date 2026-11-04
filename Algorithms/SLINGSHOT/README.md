@@ -96,3 +96,15 @@ docker run --rm -v "$PWD:/data" grnbeeline/slingshot:0.1.0 \
   trajectory algorithms to "available".
 - Reuse the project's `ClusterLabels.csv` (already collected for CellOracle) as
   `--clusters` when present; otherwise the container clusters automatically.
+
+
+### PCA solver
+
+Full PCA remains the default. `--pcaSolver truncated` requests the tested irlba
+solver; `--pcaSolver auto` requests it only on larger matrices. Both modes fall
+back to full PCA if the dependency is unavailable, convergence fails, or the
+eigenpair residual check fails. The Dockerfile includes irlba 2.3.5.1.
+
+The iterative solver can change downstream pseudotime on ambiguous data even
+when the PCA subspace is numerically close. See the audit notes before choosing
+it for a scientific analysis; it is not enabled by default in GRNScope.

@@ -39,6 +39,8 @@ option_list <- list(
               help = "Optional CSV path for the PCA coordinates used by Slingshot."),
   make_option(c("--curvesOutput"), type = "character", default = NULL,
               help = "Optional CSV path for the fitted Slingshot principal curves."),
+  make_option(c("--pcaSolver"), type = "character", default = "full",
+              help = "PCA solver: auto, full, or truncated [default %default]."),
   make_option(c("--nPCs"), type = "integer", default = 20,
               help = "Number of principal components used for the embedding [default %default]."),
   make_option(c("--nClusters"), type = "integer", default = 10,
@@ -121,7 +123,54 @@ if (n_pcs < 2) {
   fail("Not enough dimensions for a PCA embedding.")
 }
 cat(sprintf("Computing PCA (%d components)\n", n_pcs))
-pca <- stats::prcomp(analysis_expression, center = TRUE, scale. = FALSE)
+pca_solver <- tolower(opt$pcaSolver)
+if (!(pca_solver %in% c("auto", "full", "truncated"))) {
+  fail("--pcaSolver must be auto, full, or truncated.")
+}
+# Preserve the clustering RNG stream. Iterative PCA consumes random numbers;
+# doing so must not silently change the subsequent k-means initializations.
+pca_rng_state <- .Random.seed
+small_dimension <- min(dim(analysis_expression))
+use_truncated <- pca_solver == "truncated" || (
+  pca_solver == "auto" && small_dimension >= 200 && n_pcs * 5 < small_dimension
+)
+pca <- NULL
+if (use_truncated && n_pcs < small_dimension && requireNamespace("irlba", quietly = TRUE)) {
+  pca <- tryCatch({
+    center <- colMeans(analysis_expression)
+    decomposition <- withCallingHandlers(
+      irlba::irlba(analysis_expression, nv = n_pcs, center = center,
+                   tol = 1e-12, maxit = 1000,
+                   work = min(small_dimension, max(n_pcs + 16, 4 * n_pcs))),
+      warning = function(warning) stop(conditionMessage(warning))
+    )
+    fit <- list(center = center, rotation = decomposition$v,
+                sdev = decomposition$d / sqrt(nrow(analysis_expression) - 1),
+                x = sweep(decomposition$u, 2, decomposition$d, "*"))
+    # Check covariance eigenpair residuals without allocating the centered matrix.
+    projected <- analysis_expression %*% fit$rotation
+    projected <- sweep(projected, 2, as.vector(fit$center %*% fit$rotation), "-")
+    covariance_vectors <- crossprod(analysis_expression, projected) -
+      outer(fit$center, colSums(projected))
+    eigenvalues <- fit$sdev^2 * (nrow(analysis_expression) - 1)
+    residual <- covariance_vectors - sweep(fit$rotation, 2, eigenvalues, "*")
+    relative_residual <- sqrt(colSums(residual^2)) / pmax(eigenvalues, .Machine$double.eps)
+    if (any(!is.finite(relative_residual)) || max(relative_residual) > 1e-8) {
+      stop("truncated PCA residual check failed")
+    }
+    cat(sprintf("PCA solver: irlba %s; maximum relative residual %.3g\n",
+                as.character(packageVersion("irlba")), max(relative_residual)))
+    fit
+  }, error = function(error) {
+    cat(sprintf("Truncated PCA unavailable (%s); using full PCA.\n", conditionMessage(error)))
+    NULL
+  })
+}
+.Random.seed <- pca_rng_state
+if (is.null(pca)) {
+  cat("PCA solver: full SVD\n")
+  pca <- stats::prcomp(analysis_expression, center = TRUE, scale. = FALSE, rank. = n_pcs)
+}
 reduced <- pca$x[, seq_len(n_pcs), drop = FALSE]
 
 # --- 4. Cluster labels (provided, or k-means) --------------------------------

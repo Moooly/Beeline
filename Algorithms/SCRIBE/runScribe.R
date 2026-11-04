@@ -141,8 +141,8 @@ cat("Computing pseudotime.\n")
 CDS <- reduceDimension(CDS, norm_method ="none")
 CDS <- orderCells(CDS)
 
-saveRDS(CDS, file= paste0(arguments$outPrefix,'dataset.RDS'))
-write.csv(CDS@phenoData@data, file= paste0(arguments$outPrefix,'PseudoTime.csv'), quote = FALSE)
+saveRDS(CDS, file= file.path(arguments$outPrefix, paste0(arguments$outFile, '.dataset.RDS')))
+write.csv(CDS@phenoData@data, file= file.path(arguments$outPrefix, paste0(arguments$outFile, '.PseudoTime.csv')), quote = FALSE)
 }
 }
 
@@ -174,61 +174,75 @@ split_pair_graph <- function(pair_graph, workers) {
   )
 }
 
-merge_rdi_chunks <- function(chunk_results, pair_graph, pair_chunks, delays) {
-  merged <- chunk_results[[1]]
-  merged$RDI[,] <- 0
-  merged$max_rdi_value[,] <- 0
-  merged$max_rdi_delays[,] <- 0
-  n_genes <- nrow(merged$max_rdi_value)
+pack_rdi_chunk <- function(result, pairs, delays) {
+  n_genes <- nrow(result$max_rdi_value)
+  indices <- pairs + 1L
+  rdi <- vapply(seq_along(delays), function(d) {
+    result$RDI[cbind(indices[, 1], indices[, 2] + (d - 1L) * n_genes)]
+  }, numeric(nrow(pairs)))
+  list(RDI = matrix(rdi, nrow = nrow(pairs)),
+       max_rdi_value = result$max_rdi_value[indices],
+       max_rdi_delays = result$max_rdi_delays[indices])
+}
 
+merge_rdi_chunks <- function(chunk_results, pair_graph, pair_chunks, delays, gene_names) {
+  n_genes <- length(gene_names)
+  merged <- list(
+    RDI = matrix(0, n_genes, n_genes * length(delays),
+                 dimnames = list(gene_names, rep(gene_names, length(delays)))),
+    delays = as.integer(delays),
+    max_rdi_value = matrix(0, n_genes, n_genes, dimnames = list(gene_names, gene_names)),
+    max_rdi_delays = matrix(0L, n_genes, n_genes, dimnames = list(gene_names, gene_names)))
   for (chunk_index in seq_along(pair_chunks)) {
-    pair_rows <- pair_chunks[[chunk_index]]
-    current_pairs <- pair_graph[pair_rows, , drop = FALSE]
-    source_ids <- current_pairs[, 1] + 1L
-    target_ids <- current_pairs[, 2] + 1L
-    matrix_indices <- cbind(source_ids, target_ids)
-    current_result <- chunk_results[[chunk_index]]
-
-    merged$max_rdi_value[matrix_indices] <-
-      current_result$max_rdi_value[matrix_indices]
-    merged$max_rdi_delays[matrix_indices] <-
-      current_result$max_rdi_delays[matrix_indices]
-
-    for (delay_index in seq_along(delays)) {
-      rdi_indices <- cbind(
-        source_ids,
-        target_ids + (delay_index - 1L) * n_genes
-      )
-      merged$RDI[rdi_indices] <- current_result$RDI[rdi_indices]
+    indices <- pair_graph[pair_chunks[[chunk_index]], , drop = FALSE] + 1L
+    current <- chunk_results[[chunk_index]]
+    merged$max_rdi_value[indices] <- current$max_rdi_value
+    merged$max_rdi_delays[indices] <- current$max_rdi_delays
+    for (d in seq_along(delays)) {
+      merged$RDI[cbind(indices[, 1], indices[, 2] + (d - 1L) * n_genes)] <- current$RDI[, d]
     }
   }
   merged
 }
 
+repair_rdi_delays <- function(result, delays) {
+  if (length(delays) <= 1L) return(result)
+  # The bundled native extractor does not reset max_delay for each pair.
+  # Reconstruct the first maximizing delay independently for every pair.
+  n <- nrow(result$max_rdi_value)
+  best <- result$RDI[, seq_len(n), drop = FALSE]
+  result$max_rdi_delays[,] <- as.integer(delays[1])
+  for (d in seq.int(2L, length(delays))) {
+    current <- result$RDI[, seq_len(n) + (d - 1L) * n, drop = FALSE]
+    better <- !is.na(current) & !is.na(best) & current > best
+    best[better] <- current[better]
+    result$max_rdi_delays[better] <- as.integer(delays[d])
+  }
+  diag(result$max_rdi_delays) <- 0L
+  result
+}
+
 calculate_rdi_by_pairs <- function(CDS, delays, uniformalize, log_values,
                                    workers, pair_graph) {
   if (workers <= 1L) {
-    return(calculate_rdi(
+    return(repair_rdi_delays(calculate_rdi(
       CDS,
       delays = delays,
       method = 2,
       uniformalize = uniformalize,
       log = log_values
-    ))
+    ), delays))
   }
 
   pair_chunks <- split_pair_graph(pair_graph, workers)
   chunk_results <- parallel::mclapply(
     pair_chunks,
     function(pair_rows) {
-      calculate_rdi(
-        CDS,
-        delays = delays,
-        super_graph = pair_graph[pair_rows, , drop = FALSE],
-        method = 2,
-        uniformalize = uniformalize,
-        log = log_values
-      )
+      pairs <- pair_graph[pair_rows, , drop = FALSE]
+      result <- calculate_rdi(
+        CDS, delays = delays, super_graph = pairs, method = 2,
+        uniformalize = uniformalize, log = log_values)
+      pack_rdi_chunk(result, pairs, delays)
     },
     mc.cores = length(pair_chunks),
     mc.preschedule = TRUE,
@@ -241,12 +255,13 @@ calculate_rdi_by_pairs <- function(CDS, delays, uniformalize, log_values,
       paste(as.character(chunk_results[failed_chunks]), collapse = "; ")
     )
   }
-  merge_rdi_chunks(
+  repair_rdi_delays(merge_rdi_chunks(
     chunk_results,
     pair_graph,
     pair_chunks,
-    delays
-  )
+    delays,
+    rownames(exprs(CDS))
+  ), delays)
 }
 
 calculate_conditioned_chunk <- function(CDS, pair_graph, rdi_list,
@@ -271,8 +286,7 @@ calculate_conditioned_chunk <- function(CDS, pair_graph, rdi_list,
     1L,
     uniformalize
   )
-  dimnames(conditioned) <- list(colnames(genes_data), colnames(genes_data))
-  conditioned
+  conditioned[pair_graph + 1L]
 }
 
 calculate_conditioned_rdi_by_pairs <- function(CDS, rdi_list, uniformalize,
@@ -311,15 +325,16 @@ calculate_conditioned_rdi_by_pairs <- function(CDS, rdi_list, uniformalize,
     )
   }
 
-  merged <- chunk_results[[1]]
-  merged[,] <- 0
+  gene_names <- rownames(exprs(CDS))
+  merged <- matrix(0, length(gene_names), length(gene_names),
+                   dimnames = list(gene_names, gene_names))
   for (chunk_index in seq_along(pair_chunks)) {
     current_pairs <- pair_graph[pair_chunks[[chunk_index]], , drop = FALSE]
     matrix_indices <- cbind(
       current_pairs[, 1] + 1L,
       current_pairs[, 2] + 1L
     )
-    merged[matrix_indices] <- chunk_results[[chunk_index]][matrix_indices]
+    merged[matrix_indices] <- chunk_results[[chunk_index]]
   }
   merged
 }

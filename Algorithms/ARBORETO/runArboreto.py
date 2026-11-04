@@ -4,13 +4,16 @@ import sys
 import numpy as np
 import pandas as pd
 from arboreto.algo import grnboost2, genie3, diy
-from arboreto.utils import load_tf_names
+from arboreto.core import infer_partial_network, to_tf_matrix, _GRN_SCHEMA
+from dask import delayed
+from dask.dataframe import from_delayed
 from distributed import Client, LocalCluster
 
 # GENIE3 random-forest settings. Identical to Arboreto's GENIE3 defaults
 # (max_features='sqrt', n_jobs=1) except n_estimators, reduced from 1000 to 400.
-# Runtime is ~linear in the number of trees, and the top-ranked edges are
-# preserved: the change is smaller than the forest's own seed-to-seed variation.
+# This existing project default differs scientifically from upstream; use 1000
+# to reproduce the upstream forest size. A smaller forest does not guarantee
+# identical rankings.
 GENIE3_RF_KWARGS = {
     'n_jobs': 1,
     'n_estimators': 400,
@@ -63,6 +66,8 @@ def parseArgs(args):
     parser.add_option('', '--topK', type='int', default=0,
                       help='Maximum regulators written per target (0 = all).')
 
+    parser.add_option('', '--seed', type='int', default=1, help='Random seed for reproducible tree fitting.')
+
     (opts, args) = parser.parse_args(args)
 
     return opts, args
@@ -73,11 +78,40 @@ def limit_regulators_per_target(network, top_k):
     if top_k is None or int(top_k) <= 0 or network.empty:
         return network
     ordered = network.sort_values(
-        'importance', ascending=False, kind='stable'
+        ['importance', 'TF', 'target'], ascending=[False, True, True], kind='stable'
     )
     return ordered.groupby('target', sort=False, group_keys=False).head(
         int(top_k)
     )
+
+def infer_bounded_target(top_k, *args):
+    # Run reduction in the same task as the fit, so a dense target result
+    # never becomes an intermediate object managed/transferred by Dask.
+    result = infer_partial_network(*args)
+    if result is None:
+        raise RuntimeError('Arboreto did not return a target network.')
+    return limit_regulators_per_target(result, top_k)
+
+
+def infer_network(expression, *, top_k=0, **kwargs):
+    """Preserve upstream target fitting; cap each result before concatenation."""
+    if not top_k or top_k <= 0:
+        return diy(expression, **kwargs)
+    client = kwargs['client_or_address']
+    names = list(kwargs['gene_names'])
+    tf_matrix, tf_names = to_tf_matrix(expression, names, names)
+    future_matrix = client.scatter(tf_matrix, broadcast=True)
+    [future_names] = client.scatter([tf_names], broadcast=True)
+    targets = [delayed(infer_bounded_target, pure=True)(
+        top_k, kwargs['regressor_type'], kwargs['regressor_kwargs'],
+        future_matrix, future_names, name, expression[:, index], False,
+        kwargs.get('early_stop_window_length', GRNBOOST2_EARLY_STOP_WINDOW_LENGTH),
+        kwargs['seed'],
+    ) for index, name in enumerate(names)]
+    graph = from_delayed(targets, meta=_GRN_SCHEMA).repartition(
+        npartitions=max(1, len(client.ncores())))
+    return client.compute(graph, sync=True)
+
 
 def main(args):
     opts, args = parseArgs(args)
@@ -103,12 +137,14 @@ def main(args):
                     opts.maxFeatures, opts.maxFeatures)
 
             expr = inDF.to_numpy(dtype=np.float32)
-            network = diy(
+            network = infer_network(
                 expr,
+                top_k=opts.topK,
                 regressor_type='RF',
                 regressor_kwargs=rf_kwargs,
                 client_or_address=client,
                 gene_names=inDF.columns,
+                seed=opts.seed,
             )
             network = limit_regulators_per_target(network, opts.topK)
             network.to_csv(opts.outFile, index=False, sep='\t')
@@ -124,19 +160,21 @@ def main(args):
                 gbm_kwargs['max_features'] = float(opts.maxFeatures)
 
             expr = inDF.to_numpy(dtype=np.float32)
-            network = diy(
+            network = infer_network(
                 expr,
+                top_k=opts.topK,
                 regressor_type='GBM',
                 regressor_kwargs=gbm_kwargs,
                 client_or_address=client,
                 gene_names=inDF.columns,
+                seed=opts.seed,
                 early_stop_window_length=GRNBOOST2_EARLY_STOP_WINDOW_LENGTH,
             )
             network = limit_regulators_per_target(network, opts.topK)
             network.to_csv(opts.outFile, index=False, sep='\t')
 
         else:
-            print("Wrong algorithm name. Should either be GENIE3 or GRNBoost2.")
+            raise ValueError('Unknown Arboreto algorithm: ' + str(opts.algo))
     finally:
         client.close()
         local_cluster.close()

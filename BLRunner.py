@@ -4,6 +4,8 @@ import json
 import os
 import re
 import sys
+import subprocess
+import platform
 import time
 import traceback
 from contextlib import nullcontext
@@ -161,6 +163,8 @@ def collect_gnu_time_metrics(working_dir):
             2,
         ) if total_wall_seconds > 0 else None,
         'maximum_resident_set_kib': maximum_rss_kib or None,
+        'wall_time_semantics': 'sum_of_container_elapsed_times',
+        'rss_semantics': 'maximum_single_process_high_water_mark_not_aggregate',
     }
 
 
@@ -186,6 +190,12 @@ def _runner_fingerprints(runner):
     return {
         'expression_sha256': _sha256_file(expression_path),
         'pseudotime_sha256': _sha256_file(pseudotime_path),
+        'generated_inputs_sha256': {
+            str(path.relative_to(runner.working_dir)): _sha256_file(path)
+            for path in sorted(runner.working_dir.rglob('*'))
+            if path.is_file() and (path.name.startswith(('ExpressionData', 'PseudoTime', 'pseudoTimeData', 'GeneList'))
+                                   or path.name == 'hyperparameters.txt')
+        },
         'selected_cells_sha256': (
             _sha256_file(selected_cells_path) if selected_cells_path else None
         ),
@@ -194,8 +204,48 @@ def _runner_fingerprints(runner):
     }
 
 
+def runtime_provenance(runner):
+    """Identify code, image contents and host numerics, including uncommitted edits."""
+    root = Path(__file__).resolve().parent
+    files = [root / 'BLRunner.py'] + sorted((root / 'BLRun').glob('*.py'))
+    files += sorted(path for path in (root / 'Algorithms').rglob('*')
+                    if path.suffix in {'.py', '.R', '.jl', '.awk'} and path.is_file())
+    signature = hashlib.sha256()
+    for path in files:
+        signature.update(str(path.relative_to(root)).encode())
+        signature.update((_sha256_file(path) or '').encode())
+    import numpy
+    import pandas
+    result = {
+        'source_sha256': signature.hexdigest(),
+        'python': platform.python_version(),
+        'numpy': numpy.__version__, 'pandas': pandas.__version__,
+        'parameters': dict(runner.params),
+        'edge_policy': 'no_self_unique_max_absolute_positive_sign_tie_lexical_names_v1',
+    }
+    try:
+        revision = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'],
+                                  capture_output=True, text=True, timeout=5)
+        result['source_revision'] = revision.stdout.strip() if revision.returncode == 0 else None
+        if runner.image != 'local':
+            inspection = subprocess.run(['docker', 'image', 'inspect', runner.image],
+                                        capture_output=True, text=True, timeout=10)
+            if inspection.returncode == 0:
+                image = json.loads(inspection.stdout)[0]
+                result['image_id'] = image['Id']
+                result['image_digests'] = image.get('RepoDigests', [])
+            else:
+                result['image_inspection'] = 'unavailable'
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError):
+        result['image_inspection'] = 'unavailable'
+    return result
+
+
 def execute_runner(runner):
     """Execute one runner and persist phase/resource observability metadata."""
+    ranked_path = runner.output_dir / 'rankedEdges.csv'
+    if ranked_path.exists():
+        ranked_path.unlink()
     pipeline_started = time.perf_counter()
     cache_metrics_before = input_cache_metrics()
     payload = {
@@ -214,9 +264,11 @@ def execute_runner(runner):
         if hasattr(runner, 'resource_environment')
         else nullcontext()
     )
-    resource_context.__enter__()
-
+    context_entered = False
     try:
+        resource_context.__enter__()
+        context_entered = True
+        payload['provenance'] = runtime_provenance(runner)
         stage_started = time.perf_counter()
         runner.generateInputs()
         payload['stages_seconds']['input_generation'] = _rounded_seconds(
@@ -237,15 +289,22 @@ def execute_runner(runner):
 
         resource_usage = collect_gnu_time_metrics(runner.working_dir)
         if resource_usage is not None:
+            if persistent_runtime is not None:
+                resource_usage['rss_semantics'] = 'persistent_worker_lifetime_high_water_mark_not_per_request_peak'
             payload['resource_usage'] = resource_usage
             container_wall_seconds = resource_usage.get('container_wall_seconds')
-            if container_wall_seconds is not None:
+            if container_wall_seconds is not None and getattr(runner, 'execution_worker_count', 1) == 1:
                 payload['stages_seconds']['container_and_wrapper_overhead_estimate'] = (
                     _rounded_seconds(execution_seconds - container_wall_seconds)
                 )
 
         stage_started = time.perf_counter()
         runner.parseOutput()
+        if not ranked_path.is_file():
+            raise FileNotFoundError(f'Algorithm did not produce fresh ranked edges: {ranked_path}')
+        with ranked_path.open() as handle:
+            if handle.readline().rstrip('\r\n') != 'Gene1\tGene2\tEdgeWeight':
+                raise ValueError('Ranked edge output has an invalid header.')
         payload['stages_seconds']['output_parsing'] = _rounded_seconds(
             time.perf_counter() - stage_started
         )
@@ -256,11 +315,16 @@ def execute_runner(runner):
             payload['output_reduction'] = output_reduction
         payload['status'] = 'Completed'
     except Exception as exc:
+        if ranked_path.exists():
+            ranked_path.unlink()
         payload['status'] = 'Failed'
         payload['error_type'] = type(exc).__name__
         raise
     finally:
-        resource_context.__exit__(*sys.exc_info())
+        if hasattr(runner, 'release_input_views'):
+            runner.release_input_views()
+        if context_entered:
+            resource_context.__exit__(*sys.exc_info())
         pipeline_seconds = time.perf_counter() - pipeline_started
         payload['stages_seconds']['runner_pipeline_total'] = _rounded_seconds(
             pipeline_seconds
@@ -268,6 +332,8 @@ def execute_runner(runner):
         payload['stages_seconds']['runner_observed_total'] = _rounded_seconds(
             pipeline_seconds + getattr(runner, '_phase_setup_seconds', 0.0)
         )
+        if 'provenance' in payload:
+            payload['provenance']['parameters'] = dict(runner.params)
         payload['fingerprints'] = _runner_fingerprints(runner)
         cache_metrics_after = input_cache_metrics()
         payload['input_cache'] = {
@@ -304,12 +370,30 @@ def parse_args():
         type=str,
         help='Optional path written atomically when worker initialization completes.',
     )
+    parser.add_argument('--overwrite', action='store_true', help='Replace prior results for this configuration.')
     return parser.parse_args()
 
 
 def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def enabled(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if not isinstance(value, bool):
+        raise ValueError("should_run must be a boolean or a one-element boolean list.")
+    return value
+
+
+def validate_path_segment(value, label, allow_empty=False):
+    if allow_empty and value == '':
+        return
+    if not isinstance(value, str) or not value or value in ('.', '..') or any(c in value for c in '/\\\0'):
+        raise ValueError(f"{label} must be a single nonempty path segment.")
 
 
 def get_datasets(input_settings):
@@ -333,9 +417,10 @@ def get_datasets(input_settings):
     input_dir = Path.cwd() / input_settings['input_dir']
 
     for ds in input_settings['datasets']:
-        if not ds.get('should_run', [True])[0]:
+        if not enabled(ds.get('should_run'), True):
             continue
 
+        validate_path_segment(ds['dataset_id'], 'dataset_id')
         if ds.get('scan_run_subdirectories'):
             # Discover runs by scanning subdirectories of the dataset input path.
             # ds_input_path : Path — input_dir/dataset_id/
@@ -360,6 +445,7 @@ def get_datasets(input_settings):
             runs = [runs]
 
         for run in runs:
+            validate_path_segment(run['run_id'], 'run_id')
             datasets.append({
                 'dataset_id':        ds['dataset_id'],
                 'run_id':            run['run_id'],
@@ -414,6 +500,7 @@ def build_runner(
 
 
 def build_runners(config):
+    get_working_dirs(config)  # Validate the whole batch before any cleanup.
     input_settings  = config['input_settings']
     output_settings = config['output_settings']
     datasets        = get_datasets(input_settings)
@@ -422,7 +509,7 @@ def build_runners(config):
     runners = []
     for dataset in datasets:
         for algo in algorithms:
-            if not algo.get('should_run', [False])[0]:
+            if not enabled(algo.get('should_run')):
                 continue
             params = algo.get('params', {})
             setup_started = time.perf_counter()
@@ -462,19 +549,26 @@ def get_working_dirs(config):
     output_settings = config['output_settings']
     experiment_id   = output_settings.get('experiment_id', '')
     output_dir      = Path(output_settings['output_dir'])
+    validate_path_segment(experiment_id, 'experiment_id', allow_empty=True)
     datasets        = get_datasets(input_settings)
     algorithms      = input_settings.get('algorithms', [])
 
     paths = []
     for dataset in datasets:
         for algo in algorithms:
-            if not algo.get('should_run', [False])[0]:
+            if not enabled(algo.get('should_run')):
                 continue
+            validate_path_segment(algo['algorithm_id'], 'algorithm_id')
+            if algo['algorithm_id'] not in RUNNERS:
+                raise ValueError('Unknown algorithm: ' + algo['algorithm_id'])
             base_output = output_dir if output_dir.is_absolute() else root / output_dir
             if experiment_id:
                 base_output = base_output / experiment_id
             base_output = base_output / dataset['dataset_id'] / dataset['run_id'] / algo['algorithm_id']
-            paths.append(base_output / 'working_dir')
+            path = (base_output / 'working_dir').resolve()
+            if path in paths:
+                raise ValueError(f'Duplicate output directory in configuration: {path}')
+            paths.append(path)
 
     return paths
 
@@ -507,10 +601,13 @@ def warn_if_populated(working_dirs):
     return answer == 'y'
 
 
-def execute_config(config_path):
+def execute_config(config_path, *, overwrite=False, interactive=True):
     config = load_config(config_path)
-    if not warn_if_populated(get_working_dirs(config)):
-        raise RuntimeError('Run aborted because a working directory is populated.')
+    working_dirs = get_working_dirs(config)
+    populated = any(path.exists() and any(path.iterdir()) for path in working_dirs)
+    if populated and not overwrite:
+        if not interactive or not warn_if_populated(working_dirs):
+            raise RuntimeError('Run aborted because a working directory is populated; set overwrite explicitly to retry.')
 
     runners = build_runners(config)
 
@@ -547,7 +644,10 @@ def run_worker(ready_file=None):
                 request = json.loads(request_line)
                 request_id = request.get('request_id')
                 response_path = request['response_path']
-                execute_config(request['config_path'])
+                overwrite = request.get('overwrite', False)
+                if not isinstance(overwrite, bool):
+                    raise ValueError('overwrite must be a boolean.')
+                execute_config(request['config_path'], overwrite=overwrite, interactive=False)
                 response = {
                     'request_id': request_id,
                     'status': 'Completed',
@@ -583,7 +683,7 @@ def main():
         return
     if not args.config:
         raise SystemExit('--config is required unless --worker is used.')
-    execute_config(args.config)
+    execute_config(args.config, overwrite=args.overwrite, interactive=sys.stdin.isatty())
 
 
 if __name__ == '__main__':

@@ -13,10 +13,10 @@ from pysrc.evaluation import auc #to evaluate inference with auprc/auroc
 
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Run scSGL algorithm.') 
-    parser.add_argument('--expression_file', 
+        description='Run scSGL algorithm.')
+    parser.add_argument('--expression_file',
         help='Path to ExpressionData file')
-    parser.add_argument('--ground_truth_net_file', 
+    parser.add_argument('--ground_truth_net_file',
         help='Path to groundTruthNetwork file')
     parser.add_argument('--pos_density', default='0.45', #to control the density of positive part of the learned signed graph
         help='Positive density')
@@ -26,7 +26,7 @@ def get_parser() -> argparse.ArgumentParser:
         help='Association type')
     parser.add_argument('--out_file',
         help='Path to output file')
-    
+
     return parser
 
 def parse_arguments():
@@ -40,14 +40,13 @@ def main(args):
 
     opts = parse_arguments()
     expression_df = pd.read_csv(opts.expression_file, index_col=0)  #to read gene expression file
-    ref_net_df = pd.read_csv(opts.ground_truth_net_file) #to read reference network file
 
     #Learn signed graph with the parameters
     G = learn_signed_graph(expression_df.to_numpy(), pos_density=float(opts.pos_density), neg_density=float(opts.neg_density),
                                 assoc=opts.assoc, gene_names=np.array(expression_df.index))
-    #G is a dataframe with each row indicating an edge between two genes. 
+    #G is a dataframe with each row indicating an edge between two genes.
     #Each edge is also associated with a weight, which is either positive or negative depending on the sign of the edge.
-    
+
     G.to_csv(opts.out_file, index = False, sep = '\t')  #to write the output file
 
 if __name__ == "__main__":

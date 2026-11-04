@@ -6,10 +6,13 @@ import pandas as pd
 import numpy as np
 
 from BLRun.runner import Runner
+from BLRun.edges import top_indices
 
 
 class GRISLIRunner(Runner):
     """Concrete runner for the GRISLI GRN inference algorithm."""
+
+    _MIN_CONTAINER_MEMORY_MB = 1024
 
     def generateInputs(self):
         '''
@@ -106,16 +109,7 @@ class GRISLIRunner(Runner):
         if total_memory_mb is None or not trajectory_cell_counts:
             return
 
-        cpu_budget = max(1, int(getattr(self, 'cpu_budget', 1)))
-        trajectory_workers = max(
-            1,
-            int(getattr(self, 'trajectory_workers', cpu_budget)),
-        )
-        parallel_trajectories = min(
-            len(trajectory_cell_counts),
-            trajectory_workers,
-            cpu_budget,
-        )
+        parallel_trajectories = self._trajectory_worker_count(len(trajectory_cell_counts))
         memory_per_worker_mb = max(
             512,
             int(total_memory_mb) // parallel_trajectories,
@@ -220,15 +214,16 @@ class GRISLIRunner(Runner):
         PTData = self.read_pseudotime_data()
         colNames = PTData.columns
 
-        # Quit if any trajectory output is missing (matches original behaviour).
+        # A missing trajectory must fail the run instead of publishing partial results.
         for indx in range(len(colNames)):
             if not (workDir / (str(indx)+'/outFile.txt')).exists():
-                print(str(workDir / (str(indx)+'/outFile.txt')) + ' does not exist, skipping...')
-                return
+                raise FileNotFoundError(workDir / (str(indx)+'/outFile.txt'))
 
         # read input file for list of gene names
         ExpressionData = self.read_expression_data()
-        GeneList = list(ExpressionData.index)
+        gene_file = self.working_dir / 'GeneList.txt'
+        GeneList = (gene_file.read_text().splitlines() if gene_file.exists()
+                    else list(ExpressionData.index))
 
         top_k = self._resolve_top_k()
 
@@ -250,6 +245,14 @@ class GRISLIRunner(Runner):
         self._parse_output_full(workDir, colNames, GeneList)
 
     @staticmethod
+    def _validate_rank_matrix(matrix, gene_count):
+        if matrix.shape != (gene_count, gene_count):
+            raise ValueError('GRISLI matrix shape does not match retained gene list.')
+        if (matrix.dtype.kind not in 'fiu' or not np.isfinite(matrix).all()
+                or (matrix < 0).any() or (matrix > gene_count ** 2).any()):
+            raise ValueError('GRISLI rank matrix contains invalid or nonfinite ranks.')
+
+    @staticmethod
     def _iter_matrix_topk(out_path, gene_list, top_k):
         with out_path.open('r', newline='') as handle:
             first_line = handle.readline()
@@ -260,12 +263,12 @@ class GRISLIRunner(Runner):
                     yield row['Gene1'], row['Gene2'], float(row['EdgeWeight'])
             return
         matrix = pd.read_csv(out_path, sep=',', header=None).values
+        GRISLIRunner._validate_rank_matrix(matrix, len(gene_list))
         n_rows, n_cols = matrix.shape
         total = len(gene_list) * len(gene_list)
-        keep = min(top_k, n_rows)
         for col in range(n_cols):
             column = matrix[:, col]
-            candidate_rows = np.argsort(column, kind='stable')[:keep]
+            candidate_rows = top_indices(total - column, gene_list, top_k, exclude=col)
             for row in candidate_rows:
                 yield gene_list[row], gene_list[col], total - column[row]
 
@@ -275,28 +278,8 @@ class GRISLIRunner(Runner):
         sort, so the full g^2 matrix is never fully sorted. GRISLI's strongest
         edges are the smallest matrix values (EdgeWeight = g^2 - value).
         '''
-        OutMatrix = pd.read_csv(out_path, sep=',', header=None).values
-        n_rows, n_cols = OutMatrix.shape
-        total = len(GeneList) * len(GeneList)
-        keep = min(top_k, n_rows)
-
-        ranked_rows = []
-        for col in range(n_cols):
-            column = OutMatrix[:, col]
-            if keep < n_rows:
-                # smallest `keep` values == largest EdgeWeight (= total - value)
-                candidate_rows = np.argpartition(column, keep - 1)[:keep]
-            else:
-                candidate_rows = np.arange(n_rows)
-            # Order the kept regulators by descending EdgeWeight (ascending value).
-            candidate_rows = candidate_rows[np.argsort(column[candidate_rows], kind='stable')]
-            target = GeneList[col]
-            for row in candidate_rows:
-                ranked_rows.append((GeneList[row], target, total - column[row]))
-
-        self._write_ranked_edges(
-            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
-        )
+        self._write_ranked_edges(self._merge_bounded_trajectory_edges(
+            [self._iter_matrix_topk(out_path, GeneList, top_k)], top_k))
 
     def _parse_output_full(self, workDir, colNames, GeneList):
         '''
@@ -311,6 +294,7 @@ class GRISLIRunner(Runner):
             # Sort values in a matrix using code from:
             # https://stackoverflow.com/questions/21922806/sort-values-of-matrix-in-python
             OutMatrix = OutDF.values
+            self._validate_rank_matrix(OutMatrix, len(GeneList))
             idx = np.argsort(OutMatrix, axis = None)
             rows, cols = np.unravel_index(idx, OutDF.shape)
             DFSorted = OutMatrix[rows, cols]
@@ -323,7 +307,7 @@ class GRISLIRunner(Runner):
                 outFile.write('\t'.join([GeneList[row],GeneList[col],str(total-val)])+'\n')
             outFile.close()
 
-            OutSubDF[indx] = pd.read_csv(outFileName, sep = '\t', header = 0)
+            OutSubDF[indx] = pd.read_csv(outFileName, sep = '\t', header = 0, converters={0: str, 1: str})
 
             # megre the dataframe by taking the maximum value from each DF
             # From here: https://stackoverflow.com/questions/20383647/pandas-selecting-by-label-sometimes-return-series-sometimes-returns-dataframe

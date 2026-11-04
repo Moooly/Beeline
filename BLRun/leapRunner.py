@@ -1,5 +1,4 @@
 import csv
-import heapq
 import os
 from pathlib import Path
 import shlex
@@ -104,11 +103,10 @@ class LEAPRunner(Runner):
         colNames = PTData.columns
         outFileNames = ['outFile' + str(indx) + '.txt' for indx in range(len(colNames))]
 
-        # Quit if any trajectory output is missing (matches original behaviour).
+        # A missing trajectory must fail the run instead of publishing partial results.
         for outFileName in outFileNames:
             if not (workDir / outFileName).exists():
-                print(str(workDir / outFileName) + ' does not exist, skipping...')
-                return
+                raise FileNotFoundError(workDir / outFileName)
 
         top_k = self._resolve_top_k()
 
@@ -138,69 +136,10 @@ class LEAPRunner(Runner):
                 yield row.get('Gene1', ''), row.get('Gene2', ''), score
 
     def _parse_output_topk(self, out_path, top_k):
-        '''
-        Stream a single trajectory's edge list and keep only the top-K edges per
-        target (by absolute correlation) using a heap, so the full g^2 list is
-        never held in memory. LEAP is unsigned, so the weight is |Score|.
-        '''
-        target_heaps: dict = {}
-        sequence = 0
-        with out_path.open('r', newline='') as handle:
-            reader = csv.reader(handle, delimiter='\t')
-            header = next(reader, None)
-            if header is None:
-                self._write_ranked_edges(
-                    pd.DataFrame(columns=['Gene1', 'Gene2', 'EdgeWeight'])
-                )
-                return
-            column = {name: index for index, name in enumerate(header)}
-            try:
-                gene1_col, gene2_col, score_col = (
-                    column['Gene1'], column['Gene2'], column['Score']
-                )
-            except KeyError as exc:
-                raise ValueError(f"LEAP output missing expected column: {exc}")
+        self._write_ranked_edges(self._merge_bounded_trajectory_edges(
+            [self._iter_output_edges(out_path)], top_k))
 
-            widest_column = max(gene1_col, gene2_col, score_col)
-            for row in reader:
-                if len(row) <= widest_column:
-                    continue
-                try:
-                    score = abs(float(row[score_col]))
-                except ValueError:
-                    continue
-                gene1, gene2 = row[gene1_col], row[gene2_col]
-                heap = target_heaps.setdefault(gene2, [])
-                item = (score, sequence, gene1, gene2)
-                sequence += 1
-                if len(heap) < top_k:
-                    heapq.heappush(heap, item)
-                elif score > heap[0][0]:
-                    heapq.heapreplace(heap, item)
-
-        ranked_rows = []
-        for heap in target_heaps.values():
-            for score, _seq, gene1, gene2 in sorted(
-                heap, key=lambda entry: (-entry[0], entry[1])
-            ):
-                ranked_rows.append((gene1, gene2, score))
-
-        self._write_ranked_edges(
-            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
-        )
-
-    def _parse_output_full(self, workDir, outFileNames):
-        '''
-        Original full parse: absolute correlation, max across trajectories per
-        edge, ranked descending.
-        '''
-        OutSubDF = [0] * len(outFileNames)
-        for indx, outFileName in enumerate(outFileNames):
-            OutSubDF[indx] = pd.read_csv(workDir / outFileName, sep='\t', header=0)
-            OutSubDF[indx].Score = np.abs(OutSubDF[indx].Score)
-        outDF = pd.concat(OutSubDF)
-        FinalDF = outDF[outDF['Score'] == outDF.groupby(['Gene1', 'Gene2'])['Score'].transform('max')]
-
-        self._write_ranked_edges(FinalDF.sort_values('Score', ascending=False).rename(
-            columns={'Score': 'EdgeWeight'}
-        )[['Gene1', 'Gene2', 'EdgeWeight']])
+    def _parse_output_full(self, workDir, colNames):
+        self._write_ranked_edges(self._merge_trajectory_edges(
+            self._iter_output_edges(workDir / ('outFile' + str(index) + '.txt'))
+            for index in range(len(colNames))))

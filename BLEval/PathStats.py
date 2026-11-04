@@ -129,7 +129,8 @@ def _compute_path_stats(
     pred = ranked_edges[ranked_edges['Gene1'] != ranked_edges['Gene2']].copy()
     pred['EdgeWeight'] = pred['EdgeWeight'].abs().round(6)
     pred = pred[pred['EdgeWeight'] > 0]
-    pred.drop_duplicates(keep='first', inplace=True)
+    pred.sort_values('EdgeWeight', ascending=False, kind='stable', inplace=True)
+    pred.drop_duplicates(['Gene1', 'Gene2'], keep='first', inplace=True)
     pred.reset_index(drop=True, inplace=True)
 
     if pred.empty:
@@ -151,7 +152,7 @@ class PathStats(Evaluator):
     Evaluator that characterises false positive predicted edges by their
     shortest-path distance in the ground truth network.
 
-    For each algorithm, the top-k predicted edges (k = \|reference edges\|) are
+    For each algorithm, the top-k predicted edges (k = |reference edges|) are
     split into true positives and false positives. Each false positive (u, v)
     is looked up in the reference graph; if a directed path from u to v exists
     its length is binned (2–5); otherwise it is counted as having no path.

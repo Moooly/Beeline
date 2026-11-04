@@ -1,3 +1,4 @@
+import shlex
 import os
 import pandas as pd
 import numpy as np
@@ -27,7 +28,12 @@ class JUMP3Runner(Runner):
             # Acc. to JUMP3:
             # In input argument Time, the first time point of each time series must be 0.
             # Also has to be an integer!
-            newExpressionData['Time'] = PTData['PseudoTime']-PTData['PseudoTime'].min()
+            time_columns = [column for column in PTData if column != 'Experiment']
+            if len(time_columns) != 1:
+                raise ValueError('JUMP3 requires one pseudotime trajectory per run.')
+            pseudotime = PTData[time_columns[0]].dropna().sort_values(kind='stable')
+            newExpressionData = newExpressionData.loc[pseudotime.index].copy()
+            newExpressionData['Time'] = pseudotime - pseudotime.min()
             if 'Experiment' in PTData:
                 newExpressionData['Experiment'] = PTData['Experiment']
             else:
@@ -44,7 +50,7 @@ class JUMP3Runner(Runner):
         '''
 
         cmdToRun = ' '.join(['docker run --rm',
-                            f"-v {self.working_dir}:/usr/working_dir",
+                            f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
                             f'{self.image} /bin/sh -c \"time -v -o',
                             "/usr/working_dir/time.txt",
                             './runJump3',
@@ -61,8 +67,7 @@ class JUMP3Runner(Runner):
 
         # Quit if output file does not exist
         if not outFile.exists():
-            print(str(outFile) + ' does not exist, skipping...')
-            return
+            raise FileNotFoundError(outFile)
 
         # Read output
         OutDF = pd.read_csv(outFile, sep = ',')

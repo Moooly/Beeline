@@ -297,16 +297,16 @@ def extract_edges(links, p_value_cutoff: float, top_k: int) -> pd.DataFrame:
     edges = list(links.links_dict.values())[0].copy()
     # Keep significant edges; CellOracle columns: source, target, coef_mean, coef_abs, p, -logp.
     edges = edges[edges["p"] <= p_value_cutoff]
-    edges = edges[edges["coef_abs"] > 0]
-
+    edges = edges[(edges["source"] != edges["target"]) & np.isfinite(edges["coef_mean"])].copy()
+    # Rank the value that is actually emitted and used by the backend.
+    edges["_magnitude"] = edges["coef_mean"].abs()
+    edges = edges[edges["_magnitude"] > 0]
+    edges = edges.sort_values(
+        ["_magnitude", "source", "target", "coef_mean"],
+        ascending=[False, True, True, False], kind="stable",
+    ).drop_duplicates(["source", "target"])
     if top_k and not edges.empty:
-        edges = (
-            edges.sort_values("coef_abs", ascending=False)
-            .groupby("target", group_keys=False)
-            .head(top_k)
-        )
-
-    edges = edges.sort_values("coef_abs", ascending=False)
+        edges = edges.groupby("target", sort=False, group_keys=False).head(top_k)
     # Signed regulatory coefficient as edge weight (CellOracle is directed + signed).
     return pd.DataFrame({
         "Gene1": edges["source"].astype(str),

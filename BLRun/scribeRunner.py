@@ -1,5 +1,6 @@
-import heapq
+import shlex
 import os
+from pathlib import Path
 import pandas as pd
 
 from BLRun.runner import Runner
@@ -9,6 +10,7 @@ class SCRIBERunner(Runner):
     """Concrete runner for the SCRIBE GRN inference algorithm."""
 
     _MEMORY_PER_PAIR_WORKER_MB = 768
+    _MIN_CONTAINER_MEMORY_MB = 768
 
     def generateInputs(self):
         '''
@@ -62,7 +64,12 @@ class SCRIBERunner(Runner):
         # Build the command to run Scribe
         PTData = self.read_pseudotime_data()
         colNames = PTData.columns
-        pair_workers = self._resolve_pair_workers(len(colNames))
+        expression = self.read_expression_data()
+        pair_workers = self._resolve_pair_workers(
+            len(colNames), gene_count=len(expression),
+            cell_count=int(PTData.notna().sum().max()),
+        )
+        script_path = Path(__file__).resolve().parents[1] / 'Algorithms/SCRIBE/runScribe.R'
         commands = []
 
         for idx in range(len(colNames)):
@@ -73,9 +80,10 @@ class SCRIBERunner(Runner):
             timeFile = 'time'+str(idx)+".txt"
 
             cmdToRun = ' '.join(['docker run --rm',
-                           f"-v {self.working_dir}:/usr/working_dir",
+                           f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
+                           f"-v {shlex.quote(str(script_path))}:/runScribe.R:ro",
                            f'{self.image} /bin/sh -c \"time -v -o',
-                           "/usr/working_dir/" + timeFile, 'Rscript runScribe.R',
+                           "/usr/working_dir/" + timeFile, 'Rscript /runScribe.R',
                            '-e', "/usr/working_dir/" + exprName, '-c', "/usr/working_dir/" + cellName,
                            '-g', "/usr/working_dir/GeneData.csv", '-o /usr/working_dir/', '-d', delay, '-l', low,
                            '-m', method, '-x', fam, '-w', str(pair_workers),
@@ -92,41 +100,38 @@ class SCRIBERunner(Runner):
 
         self._run_docker_batch(commands)
 
-    def _resolve_pair_workers(self, trajectory_count):
-        """Divide the allocated CPU and memory safely across trajectories.
+    @staticmethod
+    def _estimate_pair_memory_bytes(gene_count, cell_count, delay_count, workers):
+        # Upstream allocates dense results even for a subset of gene pairs.
+        # Include parent merge/serialization, pair graphs and expression copies;
+        # preserve headroom for the conditioned stage and the R runtime.
+        dense_result = (8 * delay_count + 12) * gene_count ** 2
+        shared = 2 * dense_result + 48 * gene_count ** 2 + 32 * gene_count * cell_count
+        worker = dense_result + 16 * gene_count ** 2 + 24 * gene_count * cell_count
+        return 384 * 1024 ** 2 + shared + workers * worker
 
-        SCRIBE's upstream OpenMP path is disabled and marked non-thread-safe.
-        The R entrypoint therefore uses independent forked processes over
-        disjoint gene-pair chunks. This helper mirrors ``_run_docker_batch``'s
-        trajectory allocation so nested work never oversubscribes the job's
-        resource budget.
-        """
+    def _resolve_pair_workers(self, trajectory_count, *, gene_count=None, cell_count=None):
         trajectory_count = max(1, int(trajectory_count))
-        total_cpu_budget = max(1, int(getattr(self, 'cpu_budget', 1)))
-        trajectory_workers = max(
-            1,
-            int(getattr(self, 'trajectory_workers', total_cpu_budget)),
+        cpu = max(1, int(getattr(self, 'cpu_budget', 1)))
+        trajectories = self._trajectory_worker_count(trajectory_count)
+        cpu_workers = max(1, cpu // trajectories)
+        memory = getattr(self, 'memory_budget_mb', None)
+        if memory is None:
+            return cpu_workers
+        allowance = max(512, int(memory) // trajectories) * 1024 ** 2
+        if gene_count is None:
+            expression = self.read_expression_data()
+            gene_count, cell_count = expression.shape
+        delay_count = len(str(self.params.get('delay', 1)).split(','))
+        # The fixed floor still protects runtime startup on small inputs.
+        limit = min(cpu_workers, max(1, int(allowance // (768 * 1024 ** 2))))
+        for workers in range(limit, 0, -1):
+            if self._estimate_pair_memory_bytes(gene_count, cell_count, delay_count, workers) <= allowance * 0.8:
+                return workers
+        raise RuntimeError(
+            'SCRIBE cannot fit the estimated dense pair matrices in its memory budget. '
+            "Lower SCRIBE's Gene filter or trajectory concurrency, or allocate more memory."
         )
-        parallel_trajectories = min(
-            trajectory_count,
-            trajectory_workers,
-            total_cpu_budget,
-        )
-        cpu_per_trajectory = max(1, total_cpu_budget // parallel_trajectories)
-
-        total_memory_budget = getattr(self, 'memory_budget_mb', None)
-        if total_memory_budget is None:
-            return cpu_per_trajectory
-
-        memory_per_trajectory = max(
-            512,
-            int(total_memory_budget) // parallel_trajectories,
-        )
-        memory_workers = max(
-            1,
-            memory_per_trajectory // self._MEMORY_PER_PAIR_WORKER_MB,
-        )
-        return min(cpu_per_trajectory, memory_workers)
 
     def _resolve_top_k(self):
         '''
@@ -153,79 +158,30 @@ class SCRIBERunner(Runner):
         PTData = self.read_pseudotime_data()
         colNames = PTData.columns
 
-        # Quit if any trajectory output is missing (matches original behaviour).
+        # A missing trajectory must fail the run instead of publishing partial results.
         for idx in range(len(colNames)):
             if not (workDir / ('outFile'+str(idx)+'.csv')).exists():
-                print(str(workDir / ('outFile'+str(idx)+'.csv')) + ' does not exist, skipping...')
-                return
+                raise FileNotFoundError(workDir / ('outFile'+str(idx)+'.csv'))
 
-        top_k = self._resolve_top_k()
+        from BLRun.edges import reduce_edges
+        streams = (self._iter_edges(workDir / ('outFile' + str(index) + '.csv')) for index in range(len(colNames)))
+        self._write_ranked_edges(reduce_edges(streams, self._resolve_top_k()))
 
-        # Bounded fast path: a single trajectory with a per-target cap. With one
-        # trajectory there is no cross-trajectory max, so keeping only the top-K
-        # edges per target (by |EdgeWeight|) in a heap is exact and never loads
-        # the full g^2 directed edge list into memory.
-        if top_k is not None and len(colNames) == 1:
-            self._parse_output_topk(workDir / 'outFile0.csv', top_k)
-            return
-
-        # General path: original full parse across all trajectories.
-        self._parse_output_full(workDir, colNames)
+    @staticmethod
+    def _iter_edges(path):
+        with path.open('r') as handle:
+            # SCRIBE emits a headerless whitespace-separated table.
+            for line in handle:
+                parts = line.split(None)
+                if len(parts) != 3:
+                    raise ValueError("Malformed edge row in " + str(path))
+                yield parts[0], parts[1], float(parts[2])
 
     def _parse_output_topk(self, out_path, top_k):
-        '''
-        Stream a single trajectory's space-separated edge list (Gene1 Gene2
-        weight) and keep only the top-K edges per target (Gene2) by absolute
-        weight in a heap, matching GRNScope's downstream per-target cap.
-        '''
-        target_heaps: dict = {}
-        sequence = 0
-        with out_path.open('r') as handle:
-            for line in handle:
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                try:
-                    weight = float(parts[2])
-                except ValueError:
-                    continue
-                gene1, gene2 = parts[0], parts[1]
-                # GRNScope groups by Gene2 (target).
-                heap = target_heaps.setdefault(gene2, [])
-                item = (abs(weight), sequence, gene1, gene2, weight)
-                sequence += 1
-                if len(heap) < top_k:
-                    heapq.heappush(heap, item)
-                elif abs(weight) > heap[0][0]:
-                    heapq.heapreplace(heap, item)
-
-        ranked_rows = []
-        for heap in target_heaps.values():
-            for _abs_weight, _seq, gene1, gene2, weight in sorted(
-                heap, key=lambda entry: (-entry[0], entry[1])
-            ):
-                ranked_rows.append((gene1, gene2, weight))
-
-        self._write_ranked_edges(
-            pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
-        )
+        from BLRun.edges import reduce_edges
+        self._write_ranked_edges(reduce_edges([self._iter_edges(out_path)], top_k))
 
     def _parse_output_full(self, workDir, colNames):
-        '''
-        Original full parse: cross-trajectory max per edge, ranked descending.
-        '''
-        OutSubDF = [0]*len(colNames)
-        for idx in range(len(colNames)):
-            OutSubDF[idx] = pd.read_csv(workDir / ('outFile'+str(idx)+'.csv'), sep = ' ', header = None)
-
-        # megre the dataframe by taking the maximum value from each DF
-        # From here: https://stackoverflow.com/questions/20383647/pandas-selecting-by-label-sometimes-return-series-sometimes-returns-dataframe
-        outDF = pd.concat(OutSubDF)
-        outDF.columns= ['Gene1','Gene2','EdgeWeight']
-        # Group by rows code is from here:
-        # https://stackoverflow.com/questions/53114609/pandas-how-to-remove-duplicate-rows-but-keep-all-rows-with-max-value
-        res = outDF[outDF['EdgeWeight'] == outDF.groupby(['Gene1','Gene2'])['EdgeWeight'].transform('max')]
-        # Sort values in the dataframe
-        finalDF = res.sort_values('EdgeWeight',ascending=False)
-
-        self._write_ranked_edges(finalDF[['Gene1', 'Gene2', 'EdgeWeight']])
+        from BLRun.edges import reduce_edges
+        self._write_ranked_edges(reduce_edges(
+            (self._iter_edges(workDir / ('outFile' + str(index) + '.csv')) for index in range(len(colNames)))))

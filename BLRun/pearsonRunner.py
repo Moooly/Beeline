@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from BLRun.runner import Runner
+from BLRun.edges import top_indices
 
 
 # When no per-target cap is supplied (e.g. BEELINE run standalone, outside
@@ -110,6 +111,8 @@ class PearsonRunner(Runner):
         # pandas in the BEELINE environment; astype copies, so in-place ops below
         # are safe. genes x cells.
         standardized = ExpressionData.values.astype(float)
+        if not np.isfinite(standardized).all():
+            raise ValueError("Pearson requires finite expression values; impute or remove missing values first.")
         del ExpressionData
         standardized -= standardized.mean(axis=1, keepdims=True)  # center in place
         norms = np.sqrt(np.einsum('ij,ij->i', standardized, standardized))
@@ -152,19 +155,7 @@ class PearsonRunner(Runner):
         :param gene_names: list[str] — gene labels indexed by row position
         :param top_k: int | None — max edges to keep for this target, or None
         '''
-        finite_indices = np.flatnonzero(np.isfinite(row))
-        if finite_indices.size == 0:
-            return
-
-        if top_k is not None and finite_indices.size > top_k:
-            abs_values = np.abs(row[finite_indices])
-            partitioned = np.argpartition(abs_values, finite_indices.size - top_k)
-            selected = finite_indices[partitioned[finite_indices.size - top_k:]]
-        else:
-            selected = finite_indices
-
-        # Rank the kept edges by absolute correlation, descending.
-        selected = selected[np.argsort(np.abs(row[selected]))[::-1]]
+        selected = top_indices(row, gene_names, top_k, exclude=target_index)
 
         target_name = gene_names[target_index]
         for source_index in selected:
@@ -186,18 +177,14 @@ class PearsonRunner(Runner):
         '''
         outFile = self.working_dir / 'outFile.txt'
         if not outFile.exists():
-            print(str(outFile) + ' does not exist, skipping...')
-            return
+            raise FileNotFoundError(outFile)
 
-        OutDF = pd.read_csv(outFile, sep='\t', header=0)
+        OutDF = pd.read_csv(outFile, sep='\t', header=0, converters={0: str, 1: str})
         if not isinstance(OutDF, pd.DataFrame):
             raise TypeError(f"OutDF must be a DataFrame, got {type(OutDF)}")
 
         if OutDF.empty:
             self._write_ranked_edges(OutDF.reindex(columns=['Gene1', 'Gene2', 'EdgeWeight']))
             return
-
-        # Rank by absolute correlation value, descending; retain signed EdgeWeight
-        OutDF = OutDF.iloc[OutDF['EdgeWeight'].abs().argsort()[::-1]]
 
         self._write_ranked_edges(OutDF[['Gene1', 'Gene2', 'EdgeWeight']])

@@ -1,4 +1,5 @@
 import csv
+import math
 from pathlib import Path
 import shlex
 import pandas as pd
@@ -83,7 +84,7 @@ class GRNVBEMRunner(Runner):
             )
             compact_command = (
                 " && awk"
-                f" -v top_k={top_k} -v input_header=1"
+                f" -v top_k={top_k} -v input_header=1 -v strict_grnvbem=1"
                 " -v source_col=1 -v target_col=3 -v score_col=6"
                 " -v output_source=Parent -v output_target=Child"
                 " -v output_score=Score -F '\\t'"
@@ -133,8 +134,7 @@ class GRNVBEMRunner(Runner):
         # Quit if any trajectory output is missing (matches original behaviour).
         for indx in range(len(colNames)):
             if not (workDir / ('outFile'+str(indx)+'.txt')).exists():
-                print(str(workDir / ('outFile'+str(indx)+'.txt')) + ' does not exist, skipping...')
-                return
+                raise FileNotFoundError(workDir / ('outFile'+str(indx)+'.txt'))
 
         top_k = self._resolve_top_k()
 
@@ -160,7 +160,7 @@ class GRNVBEMRunner(Runner):
             reader = csv.reader(handle, delimiter='\t')
             header = next(reader, None)
             if not header:
-                return
+                raise ValueError(f'GRNVBEM output is missing its header: {out_path}')
 
             # The bundled GRNVBEM binary writes a space-delimited header above
             # tab-delimited six-column rows. The bounded compactor writes a
@@ -180,13 +180,15 @@ class GRNVBEMRunner(Runner):
                 )
 
             widest_column = max(parent_col, child_col, score_col)
-            for row in reader:
-                if len(row) <= widest_column:
-                    continue
+            for line_number, row in enumerate(reader, start=2):
+                if len(row) <= widest_column or not row[parent_col] or not row[child_col]:
+                    raise ValueError(f'Malformed GRNVBEM row {line_number} in {out_path}')
                 try:
                     score = float(row[score_col])
-                except (TypeError, ValueError):
-                    continue
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f'Invalid GRNVBEM score on row {line_number}') from exc
+                if not math.isfinite(score):
+                    raise ValueError(f'Nonfinite GRNVBEM score on row {line_number}')
                 yield (
                     row[parent_col],
                     row[child_col],

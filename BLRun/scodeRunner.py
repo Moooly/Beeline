@@ -1,8 +1,9 @@
 import os
+import shlex
 import pandas as pd
-import numpy as np
 
 from BLRun.runner import Runner
+from BLRun.edges import top_indices
 
 
 class SCODERunner(Runner):
@@ -49,21 +50,19 @@ class SCODERunner(Runner):
 
         PTData = self.read_pseudotime_data()
 
+        ExpressionData = self.read_expression_data()
         colNames = PTData.columns
         commands = []
 
         for idx in range(len(colNames)):
 
-            ExpressionData = pd.read_csv(self.working_dir /
-                                         ("ExpressionData"+str(idx)+".csv"),
-                                         header = None, index_col = None, sep ='\t')
-            nCells = str(ExpressionData.shape[1])
+            nCells = str(PTData.iloc[:, idx].notna().sum())
             nGenes = str(ExpressionData.shape[0])
 
             cmdToRun = ' '.join(['docker run --rm',
                                 f'--user {os.getuid()}:{os.getgid()}',
                                 '-e HOME=/tmp',
-                                f"-v {self.working_dir}:/usr/working_dir",
+                                f"-v {shlex.quote(str(self.working_dir))}:/usr/working_dir",
                                 f'{self.image} /bin/sh -c \"time -v -o',
                                 "/usr/working_dir/time" + str(idx) + ".txt",
                                 'ruby run_R.rb',
@@ -85,11 +84,10 @@ class SCODERunner(Runner):
         PTData = self.read_pseudotime_data()
         colNames = PTData.columns
 
-        # Quit if any trajectory output is missing (matches original behaviour).
+        # A missing trajectory must fail the run instead of publishing partial results.
         for indx in range(len(colNames)):
             if not (workDir / (str(indx)+'/meanA.txt')).exists():
-                print(str(workDir / (str(indx)+'/meanA.txt')) + ' does not exist, skipping...')
-                return
+                raise FileNotFoundError(workDir / (str(indx)+'/meanA.txt'))
 
         ExpressionData = self.read_expression_data()
         GeneList = list(ExpressionData.index)
@@ -99,7 +97,7 @@ class SCODERunner(Runner):
         # Bounded fast path: a single trajectory with a per-target cap. SCODE's
         # A matrix (meanA.txt) is inherently g x g, but the full g^2 edge list
         # need not be sorted/written: keep only the top-K regulators per target
-        # (matrix column) via a partial sort. With one trajectory there is no
+        # (matrix row) via a partial sort. With one trajectory there is no
         # cross-trajectory max, so this is exact.
         if top_k is not None and len(colNames) == 1:
             self._parse_output_topk(workDir / '0/meanA.txt', GeneList, top_k)
@@ -126,31 +124,16 @@ class SCODERunner(Runner):
 
     def _parse_output_topk(self, meanA_path, GeneList, top_k):
         '''
-        Keep only the top-K regulators per target (matrix column) by absolute
-        weight, using np.argpartition so the full g^2 matrix is never sorted.
+        Keep only the top-K regulators per target (matrix row) by absolute
+        weight, using partial selection so the full g^2 matrix is never sorted.
         '''
         OutMatrix = pd.read_csv(meanA_path, sep='\t', header=None).values
-        n_rows, n_cols = OutMatrix.shape
-        keep = min(top_k, n_rows)
-
+        if OutMatrix.shape != (len(GeneList), len(GeneList)):
+            raise ValueError("SCODE output matrix shape does not match gene count.")
         ranked_rows = []
-        for col in range(n_cols):
-            column = OutMatrix[:, col]
-            absolute_column = np.abs(column)
-            if keep < n_rows:
-                candidate_rows = np.argpartition(
-                    absolute_column,
-                    n_rows - keep,
-                )[n_rows - keep:]
-            else:
-                candidate_rows = np.arange(n_rows)
-            # Order the kept regulators by descending absolute weight.
-            candidate_rows = candidate_rows[
-                np.argsort(absolute_column[candidate_rows])[::-1]
-            ]
-            target = GeneList[col]
-            for row in candidate_rows:
-                ranked_rows.append((GeneList[row], target, column[row]))
+        for target, row in enumerate(OutMatrix):
+            for source in top_indices(row, GeneList, top_k, exclude=target):
+                ranked_rows.append((GeneList[source], GeneList[target], row[source]))
 
         self._write_ranked_edges(
             pd.DataFrame(ranked_rows, columns=['Gene1', 'Gene2', 'EdgeWeight'])
@@ -175,10 +158,11 @@ class SCODERunner(Runner):
                 )
             for row in range(matrix.shape[0]):
                 for col in range(matrix.shape[1]):
-                    yield GeneList[row], GeneList[col], matrix[row, col]
+                    yield GeneList[col], GeneList[row], matrix[row, col]
 
-        merged = self._merge_trajectory_edges(
+        from BLRun.edges import reduce_edges
+        merged = reduce_edges((
             matrix_edges(workDir / (str(index) + '/meanA.txt'))
             for index in range(len(colNames))
-        )
+        ), self._resolve_top_k())
         self._write_ranked_edges(merged)

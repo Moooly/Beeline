@@ -1,219 +1,213 @@
 #!/bin/bash
-
-set -e # abandon script on error
-BASEDIR="$(dirname "$(readlink -f "$0")")" # utils/
-ROOTDIR="$(dirname "$BASEDIR")"           # repo root
+# One-command setup for the Docker environments used by GRNScope.
+set -euo pipefail
+BASEDIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOTDIR="$(dirname "$BASEDIR")"
 
 BUILD_ALL=false
-HELP=false
-REMOVE_IMAGES=false
+DRY_RUN=false
 VERBOSE=false
-BUILD_FAILURES=()
-SETUP_FAILURES=()
+REMOVE_SCOPE=""
+# Published BEELINE images and the legacy MATLAB runtimes require amd64.
+# Docker Desktop on Apple Silicon must have x86 emulation enabled.
+PLATFORM=linux/amd64
+FAILURES=()
+WARNINGS=()
 
-# ---------------------------------------------------------------------------
-# Tested published images to PULL, for algorithms we did NOT modify inside the
-# image. Any changes to these algorithms live host-side (BLRun/*.py + GRNScope),
-# NOT in the image, so the published DockerHub builds are correct and reliable.
-# (arboreto, SCRIBE, and SINGE are excluded because the fork changes content
-# baked into those images; celloracle and slingshot are not published.)
-# ---------------------------------------------------------------------------
-PULL_IMAGES=(
-    grnbeeline/grisli:base
-    grnbeeline/grnvbem:base
-    grnbeeline/leap:base
-    grnbeeline/pidc:base
-    grnbeeline/ppcor:base
-    grnbeeline/scode:base
-    grnbeeline/sincerities:base
-)
-
-# Images that MUST be built locally. The default run builds exactly these:
-#   ARBORETO   — contains our modified runArboreto.py (GENIE3 / GRNBOOST2)
-#   CELLORACLE — new algorithm, not published to DockerHub
-#   SCRIBE     — contains our modified parallel runScribe.R entrypoint
-#   SINGE      — installs runtime tools required by our modified runner
-#   SLINGSHOT  — new pseudotime estimator, not published to DockerHub
-LOCAL_ONLY_TARGETS=(
-    "ARBORETO=grnbeeline/arboreto:base"
-    "CELLORACLE=grnbeeline/celloracle:base"
-    "SCRIBE=grnbeeline/scribe:base"
-    "SINGE=grnbeeline/singe:0.4.1"
-    "SLINGSHOT=grnbeeline/slingshot:0.1.0"
-)
-
-# Full set for --build / --build-all (rebuild every managed image from source).
-# Some legacy algorithms depend on old external repositories or compiled
-# runtimes, so all targets are attempted and failures are reported together.
-ALL_BUILD_TARGETS=(
-    "ARBORETO=grnbeeline/arboreto:base"
-    "CELLORACLE=grnbeeline/celloracle:base"
+# Current runner scripts are mounted from this checkout at execution time.
+# These published images supply the dependency environments.
+PULL_TARGETS=(
     "GRISLI=grnbeeline/grisli:base"
     "GRNVBEM=grnbeeline/grnvbem:base"
-    "JUMP3=jump3:base"
     "LEAP=grnbeeline/leap:base"
     "PIDC=grnbeeline/pidc:base"
-    "PNI=pni:base"
     "PPCOR=grnbeeline/ppcor:base"
-    "SCNS=scns:base"
     "SCODE=grnbeeline/scode:base"
-    "SCRIBE=grnbeeline/scribe:base"
-    "SCSGL=scsgl:base"
     "SINCERITIES=grnbeeline/sincerities:base"
+)
+
+# Keep our tested custom environments. Upstream ARBORETO/SCRIBE/SINGE
+# environments have not been validated as replacements for these Dockerfiles.
+LOCAL_TARGETS=(
+    "ARBORETO=grnbeeline/arboreto:base"
+    "CELLORACLE=grnbeeline/celloracle:base"
+    "SCRIBE=grnbeeline/scribe:base"
     "SINGE=grnbeeline/singe:0.4.1"
     "SLINGSHOT=grnbeeline/slingshot:0.1.0"
 )
+LEGACY_TARGETS=(
+    "JUMP3=jump3:base"
+    "PNI=pni:base"
+    "SCNS=scns:base"
+    "SCSGL=scsgl:base"
+)
+ALL_TARGETS=("${PULL_TARGETS[@]}" "${LOCAL_TARGETS[@]}" "${LEGACY_TARGETS[@]}")
 
 show_help() {
-  echo "Usage: $(basename "$0") [OPTIONS]"
-  echo "Set up BEELINE docker images for GRNScope."
-  echo ""
-  echo "Default (no options) — the recommended, correct setup:"
-  echo "  1. Pull the tested published images for unchanged algorithms."
-  echo "  2. Build ONLY the images that must be local:"
-  echo "       - arboreto   (modified: GENIE3 / GRNBOOST2)"
-  echo "       - celloracle (new, not published)"
-  echo "       - scribe     (modified parallel R entrypoint)"
-  echo "       - singe      (modified runtime dependencies)"
-  echo "       - slingshot  (new pseudotime estimator, not published)"
-  echo "  It does not rebuild images that do not need local changes."
-  echo ""
-  echo "Options:"
-  echo "  -h, --help        Display this help and exit."
-  echo "  -b, --build       Build every managed image from source locally."
-  echo "  --build-all       Alias for --build."
-  echo "  -v, --verbose     Enable verbose docker output."
-  echo "  --remove-images   Remove all managed BEELINE images, then exit (combine"
-  echo "                    with --build to remove then rebuild)."
-  echo ""
-  echo "Examples:"
-  echo "  $(basename "$0")               # pull unchanged images + build required local images"
-  echo "  $(basename "$0") --build       # build every image with one command"
-  echo "  $(basename "$0") --build-all   # same as --build"
+    cat <<'HELP'
+Usage: bash utils/initialize.sh [OPTIONS]
+
+Default: pull 7 published images and build 5 custom environments, including
+CellOracle and Slingshot. GENIE3 and GRNBoost2 share ARBORETO; Pearson needs
+no Docker image. Builds reuse Docker's layer cache on subsequent runs.
+
+All images use linux/amd64. ARM hosts need Docker x86 emulation.
+
+Options:
+  -h, --help                    Show this help.
+  --dry-run                     Preview commands without requiring Docker.
+  -b, --build, --build-all       Build all 16 managed images from source,
+                                including legacy methods outside the website.
+  -v, --verbose                 Use plain Docker build progress output.
+  --remove-images               Remove all 16 managed image tags.
+  --remove-local-images         Remove the 5 custom image tags only.
+  --remove-grnbeeline-images     Remove the 7 published image tags only.
+
+Removal exits after cleanup unless combined with --build. Only one removal
+scope may be selected. Images in use are not forcibly removed.
+
+Examples:
+  bash utils/initialize.sh              # recommended website setup
+  bash utils/initialize.sh --dry-run    # preview that setup
+  bash utils/initialize.sh --build-all  # source builds, including legacy methods
+HELP
 }
 
-while [[ "$#" -gt 0 ]]; do
-  case "$1" in
-    --build|--build-all|-b)
-      BUILD_ALL=true
-      ;;
-    -v|--verbose)
-      VERBOSE=true
-      ;;
-    -h|--help)
-      HELP=true
-      ;;
-    --remove-images|--remove-local-images|--remove-grnbeeline-images)
-      REMOVE_IMAGES=true
-      ;;
-    *)
-      echo "Unknown option: $1" >&2
-      show_help
-      exit 1
-      ;;
-  esac
-  shift
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --build|--build-all|-b) BUILD_ALL=true ;;
+        --dry-run) DRY_RUN=true ;;
+        --verbose|-v) VERBOSE=true ;;
+        --help|-h) show_help; exit 0 ;;
+        --remove-images|--remove-local-images|--remove-grnbeeline-images)
+            if [[ -n "$REMOVE_SCOPE" && "$REMOVE_SCOPE" != "$1" ]]; then
+                echo "ERROR: choose only one removal scope." >&2
+                exit 1
+            fi
+            REMOVE_SCOPE="$1"
+            ;;
+        *) echo "ERROR: unknown option: $1" >&2; show_help >&2; exit 1 ;;
+    esac
+    shift
 done
 
-if [[ "$HELP" = true ]]; then
-    show_help
-    exit 0
-fi
-
-if ! command -v docker >/dev/null 2>&1; then
-    echo "ERROR: docker is not installed or is not available in PATH." >&2
-    exit 1
-fi
-
-if ! docker info >/dev/null 2>&1; then
-    echo "ERROR: the Docker daemon is not available." >&2
-    exit 1
-fi
-
-# Build a list of "DIR=tag" targets from Algorithms/, tagged for the registry.
-build_targets() {
-    for target in "$@"; do
-        local dir="${target%%=*}"
-        local image="${target#*=}"
-        local algo_dir="$ROOTDIR/Algorithms/$dir"
-
-        if [ ! -d "$algo_dir" ]; then
-            echo "ERROR: build directory not found for $dir ($algo_dir)" >&2
-            BUILD_FAILURES+=("$dir=$image")
-            continue
-        fi
-
-        echo "----- Building $dir -> $image -----"
-        pushd "$algo_dir" > /dev/null
-        build_args=()
-        if [[ "$VERBOSE" = false ]]; then
-            build_args+=(--quiet)
-        fi
-        if docker build "${build_args[@]}" --tag "$image" .; then
-            echo "Docker image for $dir is built and tagged as $image"
-        else
-            echo "ERROR: unable to build Docker image for $dir ($image)" >&2
-            BUILD_FAILURES+=("$dir=$image")
-        fi
-        popd > /dev/null
-    done
+run_command() {
+    if [[ "$DRY_RUN" = true ]]; then
+        printf '  '
+        printf '%q ' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
 }
 
-if [[ "$REMOVE_IMAGES" = true ]]; then
-    echo "Removing BEELINE docker images managed by this script..."
-    REMOVE_TAGS=("${PULL_IMAGES[@]}")
-    for target in "${ALL_BUILD_TARGETS[@]}"; do
-        REMOVE_TAGS+=("${target#*=}")
-    done
-    for image in "${REMOVE_TAGS[@]}"; do
-        if [ "$(docker images -q "$image" 2>/dev/null)" != "" ]; then
-            docker rmi "$image" || true
-            echo "Removed $image"
+if [[ "$DRY_RUN" = false ]]; then
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "ERROR: install Docker and ensure it is available in PATH." >&2
+        exit 1
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        echo "ERROR: start Docker before running this script." >&2
+        exit 1
+    fi
+fi
+
+image_ready() {
+    local actual
+    actual="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$1" 2>/dev/null)" || return 1
+    [[ "$actual" = "$PLATFORM" ]]
+}
+
+build_target() {
+    local target="$1" dir image algo_dir
+    dir="${target%%=*}"
+    image="${target#*=}"
+    algo_dir="$ROOTDIR/Algorithms/$dir"
+    local build_args=(--platform "$PLATFORM" --tag "$image")
+    if [[ "$VERBOSE" = true ]]; then
+        build_args+=(--progress=plain)
+    fi
+    echo "Building $dir -> $image (cached layers reused)"
+    if [[ ! -f "$algo_dir/Dockerfile" ]]; then
+        echo "ERROR: missing $algo_dir/Dockerfile" >&2
+        FAILURES+=("build: $image (missing Dockerfile)")
+    elif run_command docker build "${build_args[@]}" "$algo_dir"; then
+        if [[ "$DRY_RUN" = false ]] && ! image_ready "$image"; then
+            FAILURES+=("verify: $image (expected $PLATFORM image)")
+        fi
+    else
+        FAILURES+=("build: $image")
+    fi
+}
+
+finish() {
+    local message
+    if [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        for message in "${WARNINGS[@]}"; do
+            echo "WARNING: $message" >&2
+        done
+    fi
+    if [[ ${#FAILURES[@]} -gt 0 ]]; then
+        echo "Setup completed with failures (see Docker output above):" >&2
+        for message in "${FAILURES[@]}"; do
+            echo "  $message" >&2
+        done
+        exit 1
+    fi
+}
+
+if [[ -n "$REMOVE_SCOPE" ]]; then
+    case "$REMOVE_SCOPE" in
+        --remove-images) REMOVE_TARGETS=("${ALL_TARGETS[@]}") ;;
+        --remove-local-images) REMOVE_TARGETS=("${LOCAL_TARGETS[@]}") ;;
+        --remove-grnbeeline-images) REMOVE_TARGETS=("${PULL_TARGETS[@]}") ;;
+    esac
+    for target in "${REMOVE_TARGETS[@]}"; do
+        image="${target#*=}"
+        if [[ "$DRY_RUN" = true ]] || docker image inspect "$image" >/dev/null 2>&1; then
+            if ! run_command docker image rm "$image"; then
+                FAILURES+=("remove: $image")
+            fi
         fi
     done
-    echo "Done removing images."
-
-    # Exit after removal unless a rebuild was explicitly requested.
+    # A failed cleanup must not be reported as successful, even with --build.
+    finish
     if [[ "$BUILD_ALL" = false ]]; then
+        echo "Cleanup completed (preview only when --dry-run is set)."
         exit 0
     fi
 fi
 
 if [[ "$BUILD_ALL" = true ]]; then
-    echo "Building ALL images from source locally (this may take a while)..."
-    echo "Every target will be attempted even if an earlier build fails."
-    build_targets "${ALL_BUILD_TARGETS[@]}"
+    echo "Building all 16 managed images, including legacy methods ($PLATFORM)."
+    for target in "${ALL_TARGETS[@]}"; do
+        build_target "$target"
+    done
 else
-    echo "Pulling tested published images for unchanged algorithms..."
-    for image in "${PULL_IMAGES[@]}"; do
-        pull_args=()
-        if [[ "$VERBOSE" = false ]]; then
-            pull_args+=(--quiet)
-        fi
-        if ! docker image pull "${pull_args[@]}" "$image"; then
-            if docker image inspect "$image" >/dev/null 2>&1; then
-                echo "WARNING: failed to refresh $image; using the existing local image."
-            else
-                echo "ERROR: failed to pull $image and no local copy exists." >&2
-                SETUP_FAILURES+=("$image")
+    echo "Setting up 12 images for all website methods and Slingshot ($PLATFORM)."
+    for target in "${PULL_TARGETS[@]}"; do
+        image="${target#*=}"
+        echo "Pulling $image"
+        if run_command docker image pull --platform "$PLATFORM" "$image"; then
+            if [[ "$DRY_RUN" = false ]] && ! image_ready "$image"; then
+                FAILURES+=("verify: $image (expected $PLATFORM image)")
             fi
+        elif image_ready "$image"; then
+            WARNINGS+=("could not refresh $image; using the existing $PLATFORM image.")
+        else
+            WARNINGS+=("could not pull $image; attempting its local Dockerfile.")
+            build_target "$target"
         fi
     done
-    echo ""
-    echo "Building the images that must be local (arboreto = modified, celloracle + slingshot = new)..."
-    build_targets "${LOCAL_ONLY_TARGETS[@]}"
+    for target in "${LOCAL_TARGETS[@]}"; do
+        build_target "$target"
+    done
 fi
 
-echo ""
-if (( ${#BUILD_FAILURES[@]} > 0 || ${#SETUP_FAILURES[@]} > 0 )); then
-    echo "Image setup completed with failures:" >&2
-    for target in "${BUILD_FAILURES[@]}"; do
-        echo "  build: $target" >&2
-    done
-    for image in "${SETUP_FAILURES[@]}"; do
-        echo "  pull:  $image" >&2
-    done
-    exit 1
+finish
+if [[ "$DRY_RUN" = true ]]; then
+    echo "Preview complete. No images were pulled, built, or removed."
+else
+    echo "Done. All requested images are present for $PLATFORM."
+    echo "Keep this BEELINE checkout on the server: runners mount its current scripts."
 fi
-
-echo "Done. All requested GRNScope BEELINE images are ready."
